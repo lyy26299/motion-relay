@@ -1,0 +1,61 @@
+% !TeX TS-program = xelatex
+
+\documentclass{resume}
+\ResumeName{卢洋洋}
+
+\begin{document}
+
+\ResumeContacts{
+  (+86) 177-0052-4706,%
+  \ResumeUrl{mailto:2629900951@qq.com}{2629900951@qq.com}%
+}
+
+\ResumeTitle
+
+\section{教育背景}
+\ResumeItem
+[清华大学|专业型硕士]
+{清华大学}
+[\textnormal{电子信息|} 硕士研究生]
+[2026.09—2028.06（预计）]
+
+\ResumeItem
+[北京理工大学|本科]
+{北京理工大学}
+[\textnormal{生物医学工程|} 工学学士]
+[2021.09—2025.06]
+
+\noindent{\heiti GPA}: 3.4/4.0
+
+\noindent{\heiti 核心课程}: 数值计算（95）、面向对象程序设计（95）、概率论与数理统计（95）
+
+\noindent{\heiti 语言与荣誉}: CET-4、CET-6；国家励志奖学金、校级二等奖学金、校级三等奖学金
+
+\section{专业技能}
+\begin{itemize}[leftmargin=0pt,label={},labelsep=0pt,itemindent=0pt]
+  \item[] {\heiti 后端与中间件}: Python、asyncio、WebRTC、aiortc、PyAV、SQLite；能够独立完成异步服务、音视频流转发、任务队列、超时处理和资源清理。
+  \item[] {\heiti Agent 基础与推理}: 了解 ReAct、Plan-and-Execute、反思/自校验等常见 Agent 方法，能够根据任务的实时性和可靠性要求选择合适的推理方式；理解 Talker--Reasoner 的快速响应/慢速推理分工及“观察—检索—决策—执行—再次观察”闭环。
+  \item[] {\heiti Agent 架构编排}: 能够把 Agent 拆分为感知、决策、工具调用和表达模块，设计上下文、任务取消、权限边界和异常降级；使用 Vision-Agents 接入 Qwen Omni Realtime，完成视觉、音频和语音输出的协同。
+  \item[] {\heiti RAG 与向量检索}: 了解文档切分、关键词/向量混合检索、元数据过滤和用户数据隔离；能够区分“数据库中的准确数值”和“向量库中的语义信息”，并设计带来源的 MCP 查询接口。
+  \item[] {\heiti Agent 工程化治理}: 具备数据结构设计、状态机、幂等处理、过期数据清理、故障降级和隐私边界设计经验；坚持由程序维护计数和安全状态，LLM 负责理解与表达。
+  \item[] {\heiti Embedding}: 理解向量维度、归一化、相似度计算、索引版本和异步更新；能够为个人记忆和知识文档设计可追溯、可重建的向量索引。
+  \item[] {\heiti Agent 评测}: 熟悉单元测试、离线回放、合成数据和故障注入；关注工具调用成功率、回答证据准确性、过期任务拦截、首音延迟、插话取消和 RAG Recall@K 等指标。
+  \item[] {\heiti AI Coding 工具}: 熟悉使用 Codex、Claude Code 等工具进行代码检索、任务拆分、补丁修改、测试验证和变更审查，能够复核生成代码并控制工具权限。
+\end{itemize}
+
+\section{项目经历}
+\ResumeItem{\textbf{实时多模态健身教练 Agent：Talker--Reasoner 架构设计与实现}}
+[个人开源项目]
+[2026.09—至今]
+
+\begin{itemize}[leftmargin=0pt,label={},labelsep=0pt,itemindent=0pt]
+  \item[] {\heiti 项目背景（S）}: 面向居家训练的实时教练需要同时处理视频、语音和连续动作状态；若让单个大模型串行完成感知、计数、规划和回复，容易受推理延迟影响，且计数结果难以解释和复现。
+  \item[] {\heiti 架构目标（T）}: 借鉴论文中的 Talker--Reasoner 思想，将“快速交互”和“慢速推理”解耦，设计三层 Agent：Front Agent 负责 Qwen Omni Realtime 的语音/视觉对话、轮次控制和打断；Fast Runtime 负责 Pose、FSM、计数、安全规则和 Shared State；Slow Reasoner 负责训练计划、用户建模、长期分析和反思。
+  \item[] {\heiti 独立实现（A）}: 独立完成 \texttt{StructuredPoseProcessor}、几何计算、\texttt{MotionRuntime}、\texttt{SquatFSM}、\texttt{WorkingMemory}、Qwen 协议适配和 BrowserEdge 媒体链路；将 YOLO 11 Pose 的关键点、置信度、时间戳和规则版本转为统一事实，保证 LLM 只负责理解与表达，不直接修改次数和安全状态。
+  \item[] {\heiti Loop 与记忆设计（A）}: 根据任务特点对比 ReAct、Plan-and-Execute 和纯 Realtime 对话，采用“动作循环优先、教练循环按需触发、训练总结异步执行”的策略；已实现 SQLite 事实账本和短期记忆，并为 Slow Reasoner 预留 MCP/RAG 查询、证据引用、用户 scope 和删除失效接口。
+  \item[] {\heiti 验证结果（R）}: 在 20 帧突发积压回放中丢弃 19 帧并保留首尾结果；双人物输入保留 2 组关键点但停止计数，浅蹲、画面中断、重复帧和旧任务返回均可复现处理；53 项自动化测试全部通过，并完成 Qwen 输入契约、异步生命周期和浏览器 AEC 音视频链路冒烟验证。
+\end{itemize}
+
+\noindent{\heiti 项目地址}: \ResumeUrl{https://github.com/lyy26299/vision-agent-real-demo_v2.0}{github.com/lyy26299/vision-agent-real-demo\_v2.0}
+
+\end{document}

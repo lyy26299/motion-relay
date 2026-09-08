@@ -1,0 +1,89 @@
+# Environment and Secrets
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# YOLO Models (exclude from git, download on first run)
+*.pt
+!yolo11n-pose.pt.example
+*.onnx
+*.torchscript
+runs/
+weights/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# UV Package Manager
+.venv/
+venv/
+env/
+# Application lockfiles are committed so the verified realtime stack is reproducible.
+!uv.lock
+
+# Logs
+*.log
+logs/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Linux
+*~
+.directory
+
+# Testing
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Temporary Files
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# User Data
+user_data/
+recordings/
+history/
+
+# Local Scripts (keep in scripts/ for distribution)
+!scripts/*.sh
+!scripts/*.bat
+:memory:.ses

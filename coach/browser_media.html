@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vision Coach · 全双工语音</title>
+<style>
+body{font:16px system-ui;background:#101519;color:#edf2f4;max-width:820px;margin:40px auto;padding:20px}
+video{width:100%;max-height:60vh;background:#080b0d;border-radius:16px;transform:scaleX(-1)}
+button{font:inherit;padding:12px 22px;margin:12px 8px 12px 0;border:0;border-radius:8px;cursor:pointer}
+#start{background:#ff763a} #status{white-space:pre-wrap;line-height:1.7} small{color:#a9b8c1}
+</style>
+<h1>Vision Coach</h1>
+<p>允许使用麦克风和摄像头后，即可与教练同时说话。请保持此页面打开。</p>
+<video id="preview" autoplay muted playsinline></video>
+<audio id="speaker" autoplay controls></audio><br>
+<button id="start">连接麦克风与摄像头</button><button id="stop" disabled>结束媒体连接</button>
+<p id="status" role="status">等待连接</p>
+<small>声音由此页面播放。设备可在浏览器的站点权限中选择；耳机或适中的扬声器音量有助于提升效果。</small>
+<script>
+const start = document.querySelector('#start'), stop = document.querySelector('#stop');
+const status = document.querySelector('#status'), speaker = document.querySelector('#speaker');
+const preview = document.querySelector('#preview');
+let pc, stream, closing = false, generation = 0, heartbeat;
+const endpoint = path => path + location.search;
+function release(notify = true) {
+  closing = true; generation++;
+  clearInterval(heartbeat);
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  if (pc) pc.close();
+  pc = null; preview.srcObject = null; speaker.srcObject = null;
+  stop.disabled = true;
+  if (notify) fetch(endpoint('/stop'), {method:'POST', keepalive:true}).catch(() => {});
+}
+function iceReady(peer) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {cleanup(); reject(Error('连接准备超时'));}, 10000);
+    const check = () => {if (peer.iceGatheringState === 'complete') {cleanup(); resolve();}};
+    const cleanup = () => {clearTimeout(timer); peer.removeEventListener('icegatheringstatechange', check);};
+    peer.addEventListener('icegatheringstatechange', check); check();
+  });
+}
+start.onclick = async () => {
+  start.disabled = true; closing = false;
+  const attempt = ++generation;
+  status.textContent = '请允许麦克风和摄像头权限…';
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw Error('此浏览器不支持安全媒体采集');
+    const media = await navigator.mediaDevices.getUserMedia({
+      audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1},
+      video: {width: {ideal:640}, height: {ideal:480}, frameRate: {ideal:30}}
+    });
+    if (attempt !== generation) {media.getTracks().forEach(t => t.stop()); return;}
+    stream = media;
+    const audio = stream.getAudioTracks()[0];
+    if (audio.getSettings().echoCancellation !== true) {
+      throw Error('浏览器未确认启用回声消除。请使用支持 AEC 的 Chrome/Edge 后重新开始训练。');
+    }
+    preview.srcObject = new MediaStream(stream.getVideoTracks());
+    preview.muted = true;
+    pc = new RTCPeerConnection({iceServers:[]});
+    const peer = pc;
+    peer.ontrack = event => {
+      if (event.track.kind === 'audio') {
+        speaker.srcObject = new MediaStream([event.track]);
+        speaker.play().catch(() => {status.textContent = '回声消除已启用；请点击音频播放按钮开启教练声音。';});
+      }
+    };
+    peer.onconnectionstatechange = () => {
+      if (closing) return;
+      if (peer.connectionState === 'connected') status.textContent = '已连接 · 回声消除已启用 · 支持同时说话';
+      if (['failed','closed','disconnected'].includes(peer.connectionState)) {
+        status.textContent = '连接已结束，请回到桌面重新开始训练。'; release();
+      }
+    };
+    stream.getTracks().forEach(track => {
+      peer.addTrack(track, stream);
+      track.onended = () => {if (!closing) {status.textContent='设备已断开，请重新开始训练。'; release();}};
+    });
+    stop.disabled = false;
+    await peer.setLocalDescription(await peer.createOffer());
+    await iceReady(peer);
+    if (attempt !== generation) return;
+    const response = await fetch(endpoint('/offer'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({sdp:peer.localDescription.sdp, type:'offer', aec:true}),
+      signal:AbortSignal.timeout(20000)
+    });
+    if (!response.ok) throw Error(await response.text());
+    const answer = await response.json();
+    if (attempt !== generation) return;
+    await peer.setRemoteDescription(answer);
+    // Stop capture promptly when the desktop session has closed its server.
+    heartbeat = setInterval(async () => {
+      try { const r = await fetch(endpoint('/'), {signal:AbortSignal.timeout(3000)}); if (!r.ok) throw Error(); }
+      catch { if (!closing) {status.textContent='桌面训练已结束。'; release(false);} }
+    }, 3000);
+  } catch (error) {
+    if (attempt !== generation) return;
+    status.textContent = error.message + '\n请回到桌面重新开始训练。'; release();
+  }
+};
+stop.onclick = () => {status.textContent='已结束，请回到桌面重新开始训练。'; release();};
+window.addEventListener('pagehide', () => release());
+</script>
+</html>
