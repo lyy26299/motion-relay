@@ -1,0 +1,71 @@
+name: Architecture tests
+
+on:
+  push:
+    branches: ["research/agent-architecture-v2", "research/agent-architecture-v2-*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: architecture-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UV_NO_PROGRESS: "1"
+      RUN_LIVE_QWEN_TESTS: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Capture source and revision for reproducibility
+        run: |
+          mkdir -p artifacts
+          git rev-parse HEAD > artifacts/commit.txt
+          git ls-tree -r --long HEAD > artifacts/tree.txt
+          git archive --format=zip HEAD -o artifacts/source.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: architecture-source-${{ github.sha }}
+          path: |
+            artifacts/source.zip
+            artifacts/commit.txt
+            artifacts/tree.txt
+          retention-days: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Record environment and install uv
+        run: |
+          python --version | tee artifacts/python.txt
+          uname -a > artifacts/platform.txt
+          python -m pip install uv
+          uv --version | tee artifacts/uv.txt
+      - name: Sync the pinned project environment
+        run: uv sync --locked 2>&1 | tee artifacts/sync.log
+      - name: Record installed dependencies
+        if: always()
+        run: uv pip freeze > artifacts/installed.txt 2>&1
+      - name: Run deterministic tests without live API credentials
+        run: |
+          /usr/bin/time -f 'elapsed_seconds=%e' -o artifacts/test-time.txt \
+            uv run --no-sync python -m unittest discover -s tests -v \
+            2>&1 | tee artifacts/tests.log
+      - name: Compile Python sources
+        run: uv run --no-sync python -m compileall -q coach scripts agent_local.py agent_local_agent.py
+      - name: Upload test evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: architecture-results-${{ github.sha }}
+          path: |
+            artifacts/*.txt
+            artifacts/*.log
+          retention-days: 14
