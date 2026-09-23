@@ -242,10 +242,16 @@ class VoiceOutputBoundaryTests(unittest.IsolatedAsyncioTestCase):
         async def send(event):
             entered.set()
             await release.wait()
-        llm._real_client.send_event.side_effect = send
+        client = llm._real_client
+        client.send_event.side_effect = send
         task = asyncio.create_task(llm.inject_text("first"))
         await entered.wait()
-        await llm.close()
-        release.set()
+        try:
+            await llm.close()
+        finally:
+            release.set()
         self.assertFalse(await task)
-        self.assertEqual(llm._real_client.send_event.await_count, 1)
+        # The real SDK clears _real_client during close; retain the fake
+        # handle to assert on the actual side effects, not an obsolete owner.
+        self.assertEqual(client.send_event.await_count, 1)
+        client.close.assert_awaited_once()
