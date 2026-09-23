@@ -10,7 +10,7 @@ database handle or a user-scope argument.
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import logging
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -31,9 +31,14 @@ from coach.agent_loop import (
 from coach.memory.retrieval import RetrievalService
 from coach.memory.store import MemoryStore
 from coach.mcp_server import MCPMemoryDispatcher
+from coach.arbiter import FeedbackArbiter, FeedbackKind
+from coach.operations import OperationPool
+from coach.models import CoachEvent
 from coach.runtime import MotionRuntime
 from coach.working_memory import WorkingMemory
 
+
+LOGGER = logging.getLogger(__name__)
 
 _HISTORY_TERMS = (
     "上次",
@@ -82,6 +87,15 @@ class SessionAgentBridge:
         self.qwen = qwen
         self.log = log or (lambda _message: None)
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._closed = False
+        self.task_rejections = 0
+        self._pending_work: Awaitable[Any] | None = None
+        self._output_generation = 0
+        self.arbiter = FeedbackArbiter()
+        self.io = OperationPool(max_pending=4)
+        # Snapshot epoch for pure in-loop checkpoints. Actual storage epochs
+        # are checked off-loop before an answer is sent; tools also carry one.
+        self._memory_epoch = store.get_memory_epoch(self.user_id)
         self._results_by_turn: dict[str, tuple[ToolResult, ...]] = {}
         self._trigger_text_by_turn: dict[str, str] = {}
         retrieval = RetrievalService(store, self.user_id)
@@ -90,7 +104,7 @@ class SessionAgentBridge:
             user_id=self.user_id,
             memory=memory,
             session_epoch=lambda: self._session_epoch,
-            memory_epoch=lambda: store.get_memory_epoch(self.user_id),
+            memory_epoch=lambda: self._memory_epoch,
             tools={name: self._tool for name in self.dispatcher.TOOL_NAMES},
             decider=self._decide,
             actor=self._act,
@@ -111,8 +125,9 @@ class SessionAgentBridge:
         """Schedule handling without blocking the Qwen websocket reader."""
 
         normalized = str(text).strip()
-        if not normalized:
+        if not normalized or self._closed:
             return
+        self.on_user_speech_started()
         self.memory.add_dialogue("user", normalized)
         if _is_discomfort_report(normalized):
             self.motion_runtime.pause("user_reported_discomfort")
@@ -122,19 +137,97 @@ class SessionAgentBridge:
         if _is_history_question(normalized):
             self._spawn(self._run_history_turn(normalized))
 
+    def on_user_speech_started(self) -> None:
+        """Synchronous invalidation at VAD, not after slow transcription/retrieval."""
+        if self._pending_work is not None:
+            self._pending_work.close()
+            self._pending_work = None
+        self._output_generation += 1
+        self.arbiter.interrupt()
+        self.memory.cancel_task()
+        for task in tuple(self._tasks):
+            task.cancel()
+
+    def on_motion_events(self, events: tuple[CoachEvent, ...]) -> None:
+        """Bounded trigger bridge; never wait in the pose callback."""
+        if self._closed:
+            return
+        for event in reversed(events):
+            if event.kind not in {"rep_completed", "visibility_lost", "multiple_people"}:
+                continue
+            if event.kind == "rep_completed":
+                if self._tasks or self._pending_work or self.loop.active_turn_id is not None:
+                    return  # Do not supersede a user question with routine counting.
+                text = f"本地动作记录：已完成第 {event.facts['rep_index']} 次。"
+                kind = FeedbackKind.REP
+            else:
+                # Visibility safety preempts history, but repeated reports do
+                # not continually restart a warning already being delivered.
+                active = self.arbiter.active_kind
+                if active is not None and active >= FeedbackKind.SAFETY:
+                    return
+                self.on_user_speech_started()
+                text = "当前画面不足以继续判断动作，请先暂停并确认摄像头。"
+                kind = FeedbackKind.SAFETY
+            self._spawn(self._run_motion_turn(event, text, kind))
+            break
+
+    async def _run_motion_turn(self, event: CoachEvent, text: str, kind: FeedbackKind) -> None:
+        await self.loop.run(AgentTrigger(
+            kind="motion_event", text=text, event_id=event.event_id,
+            occurred_at_mono=event.occurred_at, ttl_s=2.5,
+            metadata={"feedback_kind": int(kind)},
+        ))
+
     def _spawn(self, coroutine: Awaitable[Any]) -> None:
+        if self._closed:
+            coroutine.close()
+            return
+        if len(self._tasks) >= 4:
+            if self._pending_work is not None:
+                self._pending_work.close()
+            self._pending_work = coroutine  # One latest-work slot, not an unbounded queue.
+            self.task_rejections += 1
+            if self.task_rejections & (self.task_rejections - 1) == 0:
+                LOGGER.warning("bridge_task_rejected", extra={
+                    "component": "session_bridge", "rejections": self.task_rejections,
+                })
+            return
         task = asyncio.create_task(coroutine)
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            LOGGER.warning("bridge_task_failed", extra={"component": "session_bridge"})
+        active = self.loop.active_turn_id
+        for mapping in (self._results_by_turn, self._trigger_text_by_turn):
+            for key in tuple(mapping):
+                if key != active:
+                    mapping.pop(key, None)
+        if self._pending_work is not None and not self._closed:
+            pending, self._pending_work = self._pending_work, None
+            self._spawn(pending)
+
+    async def _io(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        operation = self.io.start(callback, *args, **kwargs)
+        done, _ = await asyncio.wait({operation}, timeout=0.5)
+        if not done:
+            raise TimeoutError("storage_operation_timeout")
+        return operation.result()
 
     async def close(self) -> None:
-        if self.loop.active_turn_id is not None:
-            await self.loop.cancel_active("session_closed")
+        self._closed = True
+        self.on_user_speech_started()
         if self._tasks:
-            for task in tuple(self._tasks):
-                task.cancel()
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-            self._tasks.clear()
+            await asyncio.wait(tuple(self._tasks), timeout=0.1)
+        pending = await self.loop.close(timeout_s=0.05)
+        pending += await self.io.close(timeout_s=0.05)
+        if pending:
+            LOGGER.warning("bridge_operations_pending_on_close", extra={"pending": pending})
+        self._results_by_turn.clear()
+        self._trigger_text_by_turn.clear()
 
     async def _safety_prompt(self, text: str) -> None:
         await self._inject(
@@ -142,7 +235,8 @@ class SessionAgentBridge:
             + text[:160]
             + "。请用一句中文明确要求立即停止训练，不要诊断原因；等待用户确认后再继续。",
             event_id=None,
-            facts={"safety_pause": True, "user_report": text[:160]},
+            facts={"safety_pause": True},
+            kind=FeedbackKind.SAFETY,
         )
 
     async def _run_history_turn(self, text: str) -> None:
@@ -153,11 +247,17 @@ class SessionAgentBridge:
         if result.status != "completed" or result.decision is None:
             self.log(f"历史检索未执行：{result.reason or result.status}")
 
-    async def _tool(self, request: Any, _context: ToolContext) -> dict[str, Any]:
+    def _tool(self, request: Any, _context: ToolContext) -> dict[str, Any]:
         return self.dispatcher.safe_dispatch(request.name, request.arguments)
 
-    def _decide(self, context: DecisionContext) -> DecisionDraft:
+    async def _decide(self, context: DecisionContext) -> DecisionDraft:
         trigger = context.observation.basis.trigger
+        if trigger.kind == "motion_event":
+            refs = tuple(ref for ref in context.observation.evidence_refs
+                         if ref.source_type == "event" and ref.source_id == trigger.event_id)
+            if not refs:
+                return DecisionDraft(action="abstain")
+            return DecisionDraft(action="cue", evidence_refs=refs, utterance_intent=trigger.text)
         if not context.tool_results:
             self._trigger_text_by_turn[context.observation.basis.turn_id] = trigger.text
             return DecisionDraft(
@@ -184,6 +284,13 @@ class SessionAgentBridge:
         )
 
     async def _act(self, decision: CoachDecision, _context: ActionContext) -> dict[str, Any]:
+        if decision.action == "cue":
+            return await self._inject(
+                decision.utterance_intent, event_id=_context.basis.trigger.event_id,
+                facts={"turn_id": decision.turn_id},
+                kind=FeedbackKind(_context.basis.trigger.metadata["feedback_kind"]),
+                is_current=_context.is_current, deadline=decision.deadline_mono,
+            )
         results = self._results_by_turn.pop(decision.turn_id, ())
         payload = [
             {
@@ -218,6 +325,7 @@ class SessionAgentBridge:
                 "evidence_ids": [ref.evidence_id for ref in decision.evidence_refs],
                 "turn_id": decision.turn_id,
             },
+            is_current=_context.is_current, deadline=decision.deadline_mono,
         )
 
     async def _inject(
@@ -226,58 +334,83 @@ class SessionAgentBridge:
         *,
         event_id: str | None,
         facts: dict[str, Any],
+        kind: FeedbackKind = FeedbackKind.ANSWER,
+        is_current: Callable[[], bool] = lambda: True,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
-        if self.qwen is None or not getattr(self.qwen, "connected", False):
-            return {"status": "rejected", "details": {"reason": "qwen_not_connected"}}
-        feedback = await asyncio.to_thread(
-            self.store.record_feedback,
-            self.user_id,
-            self.session_id,
-            cue_text=prompt[:800],
-            event_id=event_id,
-            status="generated",
-            playback_state="accepted",
-            facts=facts,
-            idempotency_key=f"agent-{self.session_id}-{time.time_ns()}",
+        generation = self._output_generation
+        admission = self.arbiter.admit(
+            kind, event_id or f"turn-{generation}-{kind.name}",
+            deadline=deadline if deadline is not None else time.monotonic() + 4.0,
         )
-        feedback_id = str(feedback["feedback_id"])
+        lease = admission.lease
+        LOGGER.info("feedback_admission", extra={
+            "component": "arbiter", "status": admission.reason,
+            "session_id": self.session_id, "event_id": event_id,
+        })
+        if lease is None:
+            return {"status": "rejected", "details": {"reason": admission.reason}}
+
+        def playback_current() -> bool:
+            return (not self._closed and generation == self._output_generation
+                    and self.arbiter.current(lease))
+
+        def current() -> bool:
+            return playback_current() and is_current()
+
+        feedback_id = None
+        accepted = False
         try:
+            if not current() or self.qwen is None or not getattr(self.qwen, "connected", False):
+                return {"status": "rejected", "details": {"reason": "stale_or_disconnected"}}
+            # Hard local pause precedes this method. Its voice request does not
+            # wait on SQLite; no durable receipt is falsely claimed for it.
+            if kind < FeedbackKind.SAFETY:
+                epoch = await self._io(self.store.get_memory_epoch, self.user_id)
+                if not current() or epoch != self._memory_epoch:
+                    return {"status": "rejected", "details": {"reason": "scope_or_turn_changed"}}
+                feedback = await self._io(
+                    self.store.record_feedback, self.user_id, self.session_id,
+                    cue_text=prompt[:800], event_id=None, status="accepted",
+                    playback_state="unknown", facts={**facts, "event_id": event_id},
+                    idempotency_key=f"agent-{self.session_id}-{lease.generation}",
+                )
+                feedback_id = str(feedback["feedback_id"])
+                epoch = await self._io(self.store.get_memory_epoch, self.user_id)
+                if epoch != self._memory_epoch:
+                    return {"status": "rejected", "details": {"reason": "scope_changed"}}
+            if not current():
+                return {"status": "rejected", "details": {"reason": "stale"}}
             accepted = await self.qwen.inject_text(
-                prompt[:6000], interrupt=True, feedback_id=feedback_id
+                prompt[:6000], interrupt=True, feedback_id=feedback_id,
+                is_current=current, playback_guard=playback_current,
             )
-        except Exception as exc:
-            await asyncio.to_thread(
-                self.store.update_feedback,
-                self.user_id,
-                feedback_id,
-                status="rejected",
-                playback_state="rejected",
-            )
-            return {"status": "rejected", "feedback_id": feedback_id, "details": {"error": str(exc)}}
-        if not accepted:
-            await asyncio.to_thread(
-                self.store.update_feedback,
-                self.user_id,
-                feedback_id,
-                status="rejected",
-                playback_state="rejected",
-            )
+            if not accepted:
+                self.arbiter.finish(lease)
+            return {"status": "queued" if accepted else "rejected", "feedback_id": feedback_id}
+        except asyncio.CancelledError:
+            self.arbiter.finish(lease)
+            raise
+        except Exception:
+            self.arbiter.finish(lease)
+            LOGGER.warning("feedback_injection_failed", extra={"component": "session_bridge"})
             return {"status": "rejected", "feedback_id": feedback_id}
-        return {"status": "queued", "feedback_id": feedback_id}
+        finally:
+            if not accepted:
+                self.arbiter.finish(lease)
+                if feedback_id is not None and not self._closed:
+                    self._spawn(self.feedback_state("rejected", feedback_id, None))
 
     async def feedback_state(
         self, state: str, feedback_id: str | None, response_id: str | None
     ) -> None:
-        if not feedback_id:
+        if not feedback_id or self._closed:
             return
-        await asyncio.to_thread(
-            self.store.update_feedback,
-            self.user_id,
-            feedback_id,
-            status=state,
-            playback_state=state,
+        # Provider generation completion is NOT speaker playback completion.
+        await self._io(
+            self.store.update_feedback, self.user_id, feedback_id,
+            status=state, playback_state="interrupted" if state == "interrupted" else "unknown",
             response_id=response_id,
-            played_at=time.time() if state == "generated" else None,
         )
 
 

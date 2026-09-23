@@ -50,6 +50,9 @@ class DuplexQwenRealtime(Realtime):
         self._active_feedback_response_id: str | None = None
         self._response_stats: dict[str, dict[str, float | int]] = {}
         self._cancelled_response_ids: set[str] = set()
+        self._injection_lock = asyncio.Lock()
+        self.user_speech_started_sink: Callable[[], None] | None = None
+        self._playback_guard: Callable[[], bool] | None = None
 
     def _build_session_config(self) -> dict:
         """Build the pinned Qwen session payload with the selected VAD mode."""
@@ -96,6 +99,8 @@ class DuplexQwenRealtime(Realtime):
         *,
         interrupt: bool = True,
         feedback_id: str | None = None,
+        is_current: Callable[[], bool] | None = None,
+        playback_guard: Callable[[], bool] | None = None,
     ) -> bool:
         """Ask the active Qwen session to speak a validated text instruction.
 
@@ -107,14 +112,26 @@ class DuplexQwenRealtime(Realtime):
         text = str(text).strip()
         if not text or not self.connected:
             return False
-        if interrupt:
-            await self._on_interruption()
-        self._active_feedback_id = feedback_id
-        self._active_feedback_response_id = None
-        await self._client.send_event(build_text_input_event(text))
-        await self._client.send_event(build_response_create_event())
-        self._schedule_feedback_sink("queued", feedback_id, None)
-        return True
+        async with self._injection_lock:
+            if is_current is not None and not is_current():
+                return False
+            if interrupt:
+                await self._on_interruption()
+                # Guarded application feedback flushes any buffered old speech,
+                # even if the provider has already finished generating it.
+                if is_current is not None:
+                    self._emit_audio_output_done_event(interrupted=True)
+            if is_current is not None and not is_current():
+                return False
+            self._active_feedback_id = feedback_id
+            self._active_feedback_response_id = None
+            self._playback_guard = playback_guard
+            await self._client.send_event(build_text_input_event(text))
+            if is_current is not None and not is_current():
+                return False
+            await self._client.send_event(build_response_create_event())
+            self._schedule_feedback_sink("queued", feedback_id, None)
+            return True
 
     def _schedule_transcript_sink(self, text: str) -> None:
         sink = self.user_transcript_sink
@@ -127,9 +144,14 @@ class DuplexQwenRealtime(Realtime):
             return
         if not inspect.isawaitable(result):
             return
+        if len(self._transcript_tasks) >= 4:
+            if inspect.iscoroutine(result):
+                result.close()
+            LOGGER.warning("transcript_observer_capacity_exhausted")
+            return
         task = asyncio.create_task(result)
         self._transcript_tasks.add(task)
-        task.add_done_callback(self._transcript_tasks.discard)
+        task.add_done_callback(lambda done: self._observer_done(done, self._transcript_tasks))
 
     def _schedule_feedback_sink(
         self, state: str, feedback_id: str | None, response_id: str | None
@@ -143,9 +165,20 @@ class DuplexQwenRealtime(Realtime):
             return
         if not inspect.isawaitable(result):
             return
+        if len(self._feedback_tasks) >= 16:
+            if inspect.iscoroutine(result):
+                result.close()
+            LOGGER.warning("feedback_observer_capacity_exhausted")
+            return
         task = asyncio.create_task(result)
         self._feedback_tasks.add(task)
-        task.add_done_callback(self._feedback_tasks.discard)
+        task.add_done_callback(lambda done: self._observer_done(done, self._feedback_tasks))
+
+    @staticmethod
+    def _observer_done(task, tasks):
+        tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            LOGGER.warning("qwen_observer_failed")
 
     async def close(self):
         # Upstream 0.6.9 lets CancelledError skip websocket/executor cleanup.
@@ -154,12 +187,13 @@ class DuplexQwenRealtime(Realtime):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._processing_task
             self._processing_task = None
-        if self._transcript_tasks:
-            await asyncio.gather(*self._transcript_tasks, return_exceptions=True)
-            self._transcript_tasks.clear()
-        if self._feedback_tasks:
-            await asyncio.gather(*self._feedback_tasks, return_exceptions=True)
-            self._feedback_tasks.clear()
+        observers = self._transcript_tasks | self._feedback_tasks
+        for task in observers:
+            task.cancel()
+        if observers:
+            _, pending = await asyncio.wait(observers, timeout=0.1)
+            if pending:
+                LOGGER.warning("qwen_observers_pending_on_close")
         self._response_stats.clear()
         self._cancelled_response_ids.clear()
         await super().close()
@@ -205,6 +239,9 @@ class DuplexQwenRealtime(Realtime):
                     self._current_response_id,
                     self._is_responding,
                 )
+                if self.user_speech_started_sink is not None:
+                    self.user_speech_started_sink()
+                self._playback_guard = None
                 self._emit_audio_output_done_event(interrupted=True)
                 self._emit_user_speech_started()
                 await self._on_interruption()
@@ -213,18 +250,22 @@ class DuplexQwenRealtime(Realtime):
                 self._emit_user_speech_ended()
             elif kind == "response.audio.done":
                 done_id = response_id or self._current_response_id
-                if done_id not in self._cancelled_response_ids and done_id not in audio_done:
+                if (done_id in (None, self._current_response_id)
+                        and done_id not in self._cancelled_response_ids and done_id not in audio_done):
                     self._emit_audio_output_done_event(response_id=done_id)
                     audio_done.add(done_id)
                     LOGGER.debug("Qwen response.audio.done id=%s", done_id)
             elif kind == "response.done":
                 done_id = event.get("response", {}).get("id")
-                if done_id not in self._cancelled_response_ids:
+                if done_id in (None, self._current_response_id) and done_id not in self._cancelled_response_ids:
                     # Older event sequences may omit response.audio.done.
                     if done_id not in audio_done:
                         self._emit_audio_output_done_event(response_id=done_id)
                     self._emit_agent_speech_transcription(text="", mode="final")
-                    self._schedule_feedback_sink("completed", self._active_feedback_id, done_id)
+                    if done_id == self._active_feedback_response_id:
+                        self._schedule_feedback_sink(
+                            "generation_completed", self._active_feedback_id, done_id
+                        )
                 stats = self._response_stats.pop(done_id, None) if done_id else None
                 if stats is not None:
                     LOGGER.debug(
@@ -240,6 +281,7 @@ class DuplexQwenRealtime(Realtime):
                     self._current_item_id = None
                     self._active_feedback_id = None
                     self._active_feedback_response_id = None
+                    self._playback_guard = None
                 self._cancelled_response_ids.discard(done_id)
                 audio_done.discard(done_id)
             elif kind == "response.audio.delta":
@@ -248,6 +290,7 @@ class DuplexQwenRealtime(Realtime):
                     and response_id not in self._cancelled_response_ids
                     and response_id not in audio_done
                     and response_id in (None, self._current_response_id)
+                    and (self._playback_guard is None or self._playback_guard())
                 ):
                     pcm = PcmData.from_bytes(base64.b64decode(event["delta"]), 24000)
                     stats_id = response_id or self._current_response_id
@@ -273,6 +316,7 @@ class DuplexQwenRealtime(Realtime):
             elif (
                 kind == "response.audio_transcript.delta"
                 and response_id not in self._cancelled_response_ids
+                and response_id in (None, self._current_response_id)
                 and (text := event.get("delta", ""))
             ):
                 self._emit_agent_speech_transcription(text=text, mode="delta")

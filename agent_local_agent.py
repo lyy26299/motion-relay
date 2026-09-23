@@ -114,7 +114,7 @@ def session_instructions(settings: SessionSettings) -> str:
     return (
         "Read @docs/COACHING_INSTRUCTIONS.md\n\n"
         f"本次训练项目：{settings.exercise}。目标：{settings.target_reps} 次。"
-        "优先观察这个动作，清晰计数，并只在必要时给出一句纠正。"
+        "次数和动作阶段只能引用本地 MotionRuntime 提供的事实；没有事实时不要估计次数。"
         "实时动作反馈严格限制为一个不超过 20 个汉字的短句，不要列点或连续补充。"
     )
 
@@ -211,6 +211,8 @@ class SessionController:
         try:
             motion, events, reps = runtime.ingest(snapshot)
             self._submit_motion(motion)
+            if self.session_agent is not None:
+                self.session_agent.on_motion_events(events)
             writer = self.ledger_writer
             if writer is not None and not writer.submit(events=events, reps=reps):
                 LOGGER.error("训练事实未能进入账本队列")
@@ -229,6 +231,8 @@ class SessionController:
             if not events:
                 continue
             self._submit_motion(runtime.fsm_snapshot())
+            if self.session_agent is not None:
+                self.session_agent.on_motion_events(events)
             writer = self.ledger_writer
             if writer is not None and not writer.submit(events=events):
                 LOGGER.error("watchdog 事实未能进入账本队列")
@@ -340,6 +344,7 @@ class SessionController:
                 qwen=qwen,
                 log=lambda message: LOGGER.info(message),
             )
+            qwen.user_speech_started_sink = self.session_agent.on_user_speech_started
             qwen.user_transcript_sink = self.session_agent.on_user_transcript
             qwen.feedback_sink = self.session_agent.feedback_state
             agent = Agent(
