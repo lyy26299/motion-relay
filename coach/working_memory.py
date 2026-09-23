@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import time
+import copy
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
+from coach.immutable import freeze
 from coach.models import CoachEvent, MotionSnapshot, PoseSnapshot, RepRecord
 
 
@@ -65,6 +67,10 @@ class WorkingMemory:
         self._state_version = 0
 
     @property
+    def pause_reason(self) -> str | None:
+        return self._pause_reason
+
+    @property
     def state_version(self) -> int:
         return self._state_version
 
@@ -88,7 +94,7 @@ class WorkingMemory:
     ) -> None:
         self._assert_session(motion.session_id)
         self._current_motion = motion
-        self._events.extend(event for event in events if event.session_id == self.session_id)
+        self._events.extend(replace(event, facts=freeze(event.facts)) for event in events if event.session_id == self.session_id)
         self._reps.extend(rep for rep in reps if rep.session_id == self.session_id)
         if motion.paused and self._pause_reason is None:
             self._pause_reason = "motion_runtime"
@@ -101,7 +107,7 @@ class WorkingMemory:
         text = text.strip()
         if not text:
             return
-        self._dialogue.append(DialogueTurn(role, text, occurred_at or time.monotonic()))
+        self._dialogue.append(DialogueTurn(role, text[:2000], time.monotonic() if occurred_at is None else occurred_at))
         self._touch()
 
     def pause(self, reason: str) -> None:
@@ -145,7 +151,7 @@ class WorkingMemory:
             events=tuple(self._events),
             reps=tuple(self._reps),
             dialogue=tuple(self._dialogue),
-            active_task=dict(self._active_task) if self._active_task else None,
+            active_task=copy.deepcopy(self._active_task) if self._active_task else None,
             pause_reason=self._pause_reason,
         )
 

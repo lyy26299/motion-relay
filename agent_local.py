@@ -57,7 +57,7 @@ class FitnessCoachUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.alive = True
-        self.actions: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.actions: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=16)
         self.logs: queue.Queue[str] = queue.Queue(maxsize=400)
         self.frames: queue.Queue[Any] = queue.Queue(maxsize=2)
         self.poses: queue.Queue[PoseSnapshot] = queue.Queue(maxsize=1)
@@ -479,20 +479,30 @@ class FitnessCoachUI:
                 activebackground=self.ACCENT_ACTIVE if selected else self.BORDER,
             )
 
+    def _queue_action(self, action: str, payload: Any = None) -> None:
+        if action in {"stop", "close"}:
+            # Tk callbacks and this queue's consumer share the desktop loop.
+            # A stop must not sit behind a backlog of starts.
+            while not self.actions.empty():
+                with contextlib.suppress(queue.Empty):
+                    self.actions.get_nowait()
+        with contextlib.suppress(queue.Full):
+            self.actions.put_nowait((action, payload))
+
     def _primary_action(self) -> None:
         if self._state in {"starting", "running"}:
             self._request_stop()
         elif self._state in {"idle", "error"}:
             with contextlib.suppress(ValueError, tk.TclError):
-                self.actions.put(("start", self.current_settings()))
+                self._queue_action("start", self.current_settings())
 
     def _request_stop(self) -> None:
         if self._state in {"starting", "running"}:
-            self.actions.put(("stop", None))
+            self._queue_action("stop")
 
     def _on_close(self) -> None:
         self.alive = False
-        self.actions.put(("close", None))
+        self._queue_action("close")
 
     def current_settings(self) -> SessionSettings:
         target = max(1, min(99, int(self.target_var.get())))
