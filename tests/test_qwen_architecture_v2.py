@@ -55,7 +55,7 @@ class QwenArchitectureTests(unittest.IsolatedAsyncioTestCase):
     async def test_generation_done_is_not_playback_done(self):
         llm = self.make_llm([
             {"type": "response.created", "response": {"id": "one"}},
-            {"type": "response.done", "response": {"id": "one"}},
+            {"type": "response.done", "response": {"id": "one", "status": "completed"}},
         ])
         llm._active_feedback_id = "feedback"
         llm.feedback_sink = Mock()

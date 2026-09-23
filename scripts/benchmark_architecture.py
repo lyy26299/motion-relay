@@ -118,6 +118,21 @@ def main():
             assert lease is not None
             arbiter.finish(lease)
         metrics["feedback_arbitration"] = measure(arbitrate, n)
+    try:
+        from coach.voice_state import ResponseWindow
+    except ImportError:
+        metrics["voice_response_identity_cycle"] = {
+            "available": False, "reason": "not implemented in baseline"}
+    else:
+        window = ResponseWindow()
+        response_ids = iter([f"response-{i}" for i in range(n+101)])
+        def voice_identity_cycle():
+            response_id = next(response_ids)
+            assert window.begin(response_id) == "started"
+            assert window.accepts(response_id, audio=True)
+            assert window.finish_audio(response_id)
+            assert window.finish(response_id)
+        metrics["voice_response_identity_cycle"] = measure(voice_identity_cycle, n)
     result = {
         "schema_version": "coach.benchmark.v1", "source_revision": args.source_revision,
         "environment": {"python": platform.python_version(), "platform": platform.platform(),

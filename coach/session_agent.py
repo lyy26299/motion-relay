@@ -91,6 +91,7 @@ class SessionAgentBridge:
         self.task_rejections = 0
         self._pending_work: Awaitable[Any] | None = None
         self._output_generation = 0
+        self._awaiting_user_transcript = False
         self.arbiter = FeedbackArbiter()
         self.io = OperationPool(max_pending=4)
         # Snapshot epoch for pure in-loop checkpoints. Actual storage epochs
@@ -127,7 +128,13 @@ class SessionAgentBridge:
         normalized = str(text).strip()
         if not normalized or self._closed:
             return
-        self.on_user_speech_started()
+        had_vad = self._awaiting_user_transcript
+        self._awaiting_user_transcript = False
+        # VAD already invalidated the previous turn. A normal final transcript
+        # must not cancel the native answer that has just started. Routed turns
+        # still revoke that answer before accessing memory or issuing a warning.
+        if not had_vad or _is_discomfort_report(normalized) or _is_history_question(normalized):
+            self._invalidate_output()
         self.memory.add_dialogue("user", normalized)
         if _is_discomfort_report(normalized):
             self.motion_runtime.pause("user_reported_discomfort")
@@ -139,6 +146,10 @@ class SessionAgentBridge:
 
     def on_user_speech_started(self) -> None:
         """Synchronous invalidation at VAD, not after slow transcription/retrieval."""
+        self._awaiting_user_transcript = True
+        self._invalidate_output()
+
+    def _invalidate_output(self) -> None:
         if self._pending_work is not None:
             self._pending_work.close()
             self._pending_work = None
@@ -147,6 +158,30 @@ class SessionAgentBridge:
         self.memory.cancel_task()
         for task in tuple(self._tasks):
             task.cancel()
+
+    def admit_native_response(self, response_id: str) -> Callable[[], bool] | None:
+        """Grant output permission, NOT evidence validation or request attribution.
+
+        The provider calls this synchronously before emitting a native response.
+        No database or model calls are allowed on this admission path.
+        """
+        if (self._closed or not isinstance(response_id, str) or not response_id.strip()
+                or len(response_id) > 249 or self._tasks or self._pending_work is not None
+                or self.loop.active_turn_id is not None):
+            return None
+        generation = self._output_generation
+        admission = self.arbiter.admit(
+            FeedbackKind.ANSWER, f"native:{response_id}", deadline=time.monotonic() + 12.0,
+        )
+        lease = admission.lease
+        if lease is None:
+            return None
+
+        def current() -> bool:
+            return (not self._closed and generation == self._output_generation
+                    and self.arbiter.current(lease))
+
+        return current
 
     def on_motion_events(self, events: tuple[CoachEvent, ...]) -> None:
         """Bounded trigger bridge; never wait in the pose callback."""
@@ -166,7 +201,7 @@ class SessionAgentBridge:
                 active = self.arbiter.active_kind
                 if active is not None and active >= FeedbackKind.SAFETY:
                     return
-                self.on_user_speech_started()
+                self._invalidate_output()
                 text = "当前画面不足以继续判断动作，请先暂停并确认摄像头。"
                 kind = FeedbackKind.SAFETY
             self._spawn(self._run_motion_turn(event, text, kind))
@@ -219,7 +254,8 @@ class SessionAgentBridge:
 
     async def close(self) -> None:
         self._closed = True
-        self.on_user_speech_started()
+        self._awaiting_user_transcript = False
+        self._invalidate_output()
         if self._tasks:
             await asyncio.wait(tuple(self._tasks), timeout=0.1)
         pending = await self.loop.close(timeout_s=0.05)
@@ -372,7 +408,8 @@ class SessionAgentBridge:
                 feedback = await self._io(
                     self.store.record_feedback, self.user_id, self.session_id,
                     cue_text=prompt[:800], event_id=None, status="accepted",
-                    playback_state="unknown", facts={**facts, "event_id": event_id},
+                    playback_state="unknown", facts={**facts, "event_id": event_id,
+                                                     "response_correlation": "unverified"},
                     idempotency_key=f"agent-{self.session_id}-{lease.generation}",
                 )
                 feedback_id = str(feedback["feedback_id"])
@@ -387,7 +424,8 @@ class SessionAgentBridge:
             )
             if not accepted:
                 self.arbiter.finish(lease)
-            return {"status": "queued" if accepted else "rejected", "feedback_id": feedback_id}
+            return {"status": "queued" if accepted else "rejected", "feedback_id": feedback_id,
+                    "details": {"response_correlation": "unverified"}}
         except asyncio.CancelledError:
             self.arbiter.finish(lease)
             raise

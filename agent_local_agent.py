@@ -347,6 +347,7 @@ class SessionController:
             qwen.user_speech_started_sink = self.session_agent.on_user_speech_started
             qwen.user_transcript_sink = self.session_agent.on_user_transcript
             qwen.feedback_sink = self.session_agent.feedback_state
+            qwen.native_response_gate = self.session_agent.admit_native_response
             agent = Agent(
                 edge=edge,
                 agent_user=User(name="AI 健身教练"),
