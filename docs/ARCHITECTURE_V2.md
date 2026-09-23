@@ -1,8 +1,8 @@
-# Motion Relay Architecture V2
+# Motion Relay Architecture V2（含 V2.1 语音增量）
 
-日期：2026-09-23。代码基线：`f2f104d3c280972bc9e3aecb75fdafe8c76a4f85`。已验证实现快照：`d45ddeb76badc4f6d5ef77599cdfe9d6865d52d2`。
+日期：2026-09-23。代码基线：`f2f104d3c280972bc9e3aecb75fdafe8c76a4f85`。V2.0 已验证快照：`d45ddeb76badc4f6d5ef77599cdfe9d6865d52d2`。V2.1 增量起点：`46a2061fedebdd15c52cc4e8bd2441683ae01d14`；语音实现：`2f08e8d494bce3cd1ec8b6d6c203dd38757d17b5`。
 
-这是面向首次接手项目工程师的运行时说明。**“已实现”指上述快照及其文档/CI 后续提交；“待实现”是明确的后续工作，不表示当前存在该能力。** 全链路统一语音控制、真实播放 ACK、完整 exercise 插件和生产级 tracing 尚未完成。测试与基准的实测证据见 [TEST_REPORT](TEST_REPORT.md)，缺陷定位见 [AUDIT](ARCHITECTURE_AUDIT.md)，外部依据见 [RESEARCH](AGENT_ARCHITECTURE_RESEARCH.md)。
+这是面向首次接手项目工程师的运行时说明。**本文件已同步 V2.1 实际连线；未修改的领域/存储模块沿用 V2.0。** 默认 SessionController 的原生输出已接入共享准入；原生内容的事实验证、手动/自动响应的严格因果关联、真实播放 ACK、完整 exercise 插件和生产级 tracing 仍未完成。语音详细契约见 [VOICE_OUTPUT_V2_1](VOICE_OUTPUT_V2_1.md)，关键变化见第37节。测试与基准的实测证据见 [TEST_REPORT](TEST_REPORT.md)，缺陷定位见 [AUDIT](ARCHITECTURE_AUDIT.md)，外部依据见 [RESEARCH](AGENT_ARCHITECTURE_RESEARCH.md)。
 
 ## 1. Problem Definition
 
@@ -47,14 +47,17 @@ flowchart LR
   A --> V[Decision / evidence validation]
   V --> F[FeedbackArbiter]
   F --> Q[Guarded Qwen injection]
-  Q --> E
+  Q --> OG[ResponseWindow / output guards]
+  OG --> E
   E --> U[Speaker]
   E --> N[Native Qwen realtime conversation]
-  N --> E
+  N --> NA[Native response admission]
+  NA -. lease check .-> F
+  NA --> OG
   N --> S
 ```
 
-图中 `Native Qwen realtime conversation → edge` 是**仍然存在的旁路**，并没有穿过 FeedbackArbiter。V2 目前控制 bridge 发起的历史回答、rep 和部分安全提示，不是全部普通对话。下一阶段需要统一实际输出出口，不能在图中假装这条旁路已经消失。
+V2.1 中，默认 SessionController 将原生响应交给 `admit_native_response`，共享同一个 FeedbackArbiter，并与受控注入共同经过显式 response ID / guard 检查。**输出准入不等于内容验证**：原生内容仍不经过 AgentLoop evidence validation；混合自动/手动模式中的注入候选仍标记 `response_correlation=unverified`。独立构造 adapter 而不连接 native gate 时仍保留兼容旁路。
 
 ## 6. Component Responsibilities
 
@@ -68,9 +71,10 @@ flowchart LR
 | `coach/working_memory.py` | 有界会话快照与状态版本 | 不作为完整历史数据库 |
 | `coach/agent_loop.py` | 受限工具/决定循环、scope、evidence、deadline、取消检查 | 不拥有摄像头状态，不保证 actor 任意副作用可回滚 |
 | `coach/operations.py` | 未完成操作的容量与异常回收 | 不强制杀死 Python 线程 |
-| `coach/session_agent.py` | 业务触发、工具映射、反馈准入、受控 Qwen 注入 | 不是通用训练规划器，也未控制全部原生回答 |
+| `coach/session_agent.py` | 业务触发、工具映射、反馈准入、原生回答 lease、受控 Qwen 注入 | 不验证原生回答语义，不证明请求因果关系 |
 | `coach/arbiter.py` | 单槽反馈准入、优先级、TTL、去重、cooldown | 不是 TTS，不是完整 speech-duration scheduler |
-| `coach/qwen_duplex.py` | WebSocket 事件、barge-in、受控请求 guard、response ID 过滤 | 不把 generation done 视为扬声器确认 |
+| `coach/qwen_duplex.py` | WebSocket、单 pending 注入、native gate、严格 ID、取消隔离 | 不把生成事件或候选绑定视为已听见/已证明因果 |
+| `coach/voice_state.py` | 单活动 ResponseWindow、256项退役窗口、幂等终结 | 不持有网络、文本、音频或客户端请求归属 |
 | `coach/browser_edge.py` | 本地 WebRTC、音频缓冲、flush、loopback 访问约束 | 尚不提供完整浏览器真实 playout ACK |
 | `coach/memory/*` | 持久化、业务检索、确定性整合、后台写入 | 不反向创建实时动作事实 |
 
@@ -137,7 +141,7 @@ sequenceDiagram
 
 UI start 进入 controller，建立用户/session、memory store、writer、working memory、motion runtime、browser edge、pose processor 与 Qwen。资源注册和模型初始化不属于 steady-state pose ingest 微基准。启动时的存储/模型等待仍需独立性能分析。
 
-停止时先使应用工作失效，停止接纳，再关闭 bridge、媒体与 writer，并依据 writer 完整性决定会话能否称正常结束。Bridge 对自己的取消等待有上界，但这**不等于**第三方 SDK 的全部 close 或 Python executor 退出都已具备硬超时。
+UI stop 设置 stop_event；controller 的 finally 当前先关闭 agent/媒体，再经 `_finish_memory` 关闭 bridge、watchdog 与 writer。V2.1 的 Qwen close 在第一个 await 前使语音状态失效，但全会话 shutdown 尚不是统一原子撤销协议。writer 完整性决定会话能否称正常结束。Bridge 对自己的取消等待有上界，但这**不等于**第三方 SDK 的全部 close 或 Python executor 退出都已具备硬超时。
 
 UI 控制队列本轮限定16。stop/close 会清理过期排队控制，避免“停止”排在一串 start 后面；它不通过改写用户文件或数据库来取消会话。
 
@@ -242,7 +246,7 @@ flowchart TD
 |---|---:|---:|---|
 | Emergency | 100 | 无 | 类别预留，不等于已有专用硬件紧急检测 |
 | Safety | 90 | 无 | 不适报告、可见性/多人的保守暂停提示 |
-| Direct answer | 80 | 无 | 受控历史回答 |
+| Direct answer | 80 | 无 | 受控历史回答与默认入口原生回答 |
 | Form correction | 70 | 3s | policy 类别，尚无完整新纠正模块 |
 | Instruction | 60 | 无 | policy 类别 |
 | Rep | 50 | 0.8s | 本地 rep_completed |
@@ -267,7 +271,7 @@ flowchart TD
 | history | scope/epoch + evidence provenance + turn deadline | 历史事实可以久远，但回答必须属于当前用户和当前请求 |
 | speech | output generation + lease + response ID | 不能撤回已播放声音；浏览器排队中的完成状态仍未知 |
 
-数据库 epoch 查询与外部网络发送之间不是分布式事务。删除发生在最后检查之后、或存在原生输出旁路时，仍需 invalidation broadcast 与统一出口补强。
+数据库 epoch 查询与外部网络发送之间不是分布式事务。V2.1 原生准入不查询数据库，删除发生在最后检查之后仍需 invalidation broadcast；未接 native gate 的独立 adapter 也不具备应用准入保证。
 
 ## 17. User Interruption Sequence
 
@@ -291,7 +295,7 @@ sequenceDiagram
   Note over B: 实际用户听到的停止延迟需要硬件测量
 ```
 
-最终转录也会再次撤销旧工作，以免在 VAD 与文本完成之间又出现旧提示。关键词路由是保守启发式，含否定词时可能误触发；没有把它宣传为完整意图识别模型。
+V2.1 区分 VAD 与普通最终转录：VAD 立即失效旧工作；随后普通 final transcript 不重复撤销已经开始的新原生回答。历史问题/不适报告仍在路由前撤销，直接文本输入无 VAD 时也会失效。该标记不等于完整 ASR item 关联；关键词路由仍是保守启发式。
 
 ## 18. Safety Event Sequence
 
@@ -414,11 +418,11 @@ Claim 的数据链应为：实际 rep/event → source ID/revision/规则版本/
 
 ## 25. Voice Pipeline
 
-受控路径：Decision → FeedbackArbiter → guarded injection → Qwen 生成 → audio delta → browser edge buffer → WebRTC → speaker。原生路径：microphone/camera → Qwen 原生对话 → edge；它仍绕过应用统一准入。
+受控路径：Decision → FeedbackArbiter → guarded injection → pending candidate → ResponseWindow / guard → browser edge buffer。默认原生路径：microphone/camera → Qwen → ResponseWindow → native admission（共享 arbiter）→ exact-ID audio / transcript guard → edge。两者都到 WebRTC/speaker，但只有前者带 AgentLoop 决策证据，且其客户端请求因果绑定仍未验证。
 
 已有 browser audio 使用48kHz、20ms帧；启动预缓冲默认160ms、重缓冲200ms、最大1000ms。缓冲吸收抖动，也带来首播延迟；不能把本地 arbiter 的几微秒与整体听感延迟混为一谈。
 
-Qwen response.done/audio.done 是生成流的事件，不能证明音频已在用户端播完。本轮把反馈标为 generation_completed 且 playback unknown；被中断则记录 interrupted。迟到的旧 response.done 不能把新反馈完成。尚无可靠 played_at。
+Qwen response.done/audio.done 是生成流的事件，不能证明音频已在用户端播完。V2.1 仅在 status=completed 时记 generation_completed；failed/incomplete/cancelled 分别记录，缺失/未知记 generation_unknown。playback 仍 unknown 或 interrupted，不写可靠性未经证实的 played_at。缺失 ID 不再回退到当前响应。
 
 ## 26. Queue / Backpressure Inventory
 
@@ -436,7 +440,7 @@ Qwen response.done/audio.done 是生成流的事件，不能证明音频已在�
 | Qwen observers | transcript异步4、feedback异步16 | 超额拒绝，异常回收，有限关闭等待 | capacity warning |
 | Browser audio | 默认最多1000ms，约50个20ms帧 | 背压、flush generation、预缓冲 | 原音频队列测试 |
 
-这不是对第三方 SDK 每一个队列的完整审计。Qwen 未终结响应的统计/关联表等仍需长时间故障压测。
+V2.1 再限制：响应身份1个活动、256个退役 ID、1个 pending injection、1个未完成 cancel task；活动响应统计随身份终结清理。有限窗口不是终身反重放保护；第三方 SDK 其他队列仍需长时间故障压测。
 
 ## 27. State Ownership Diagram
 
@@ -510,7 +514,7 @@ flowchart TD
 
 临时本地工程目标可设为：ingest/仲裁不等待外部 IO，过期/取消副作用在测试中为0，队列不超过上界；绝对端到端 SLA 要从设备与交互实验建立，不能根据 synthetic 微秒数反推。
 
-Motion ingest P95 从18.375µs变为38.432µs，代价来自更强所有权处理；本轮不声称整体提速。所有指标同时看P50/P95/P99、样本量和环境，见测试报告。
+V2.0 固定实验的 Motion ingest P95 从18.375µs变为38.432µs，代价来自更强所有权处理；不冒充 V2.1 新测量，也不声称整体提速。所有指标同时看P50/P95/P99、样本量和环境，见测试报告。
 
 ## 32. Testing Strategy
 
@@ -526,7 +530,7 @@ Motion ingest P95 从18.375µs变为38.432µs，代价来自更强所有权处�
 
 Memory scope 由应用构造，工具不暴露任意 user_id。个人历史经结构化服务返回，不将 API key 混作用户身份。环境 `.env` 不提交。Prompt 与 retrieved text 都不能代替代码授权。
 
-当前没有全局多租户生产鉴权、任意插件沙箱或用户删除到所有语音出口的原子失效协议。原生对话旁路是需要明确审查的安全边界，而不是文档遗漏。
+当前没有全局多租户生产鉴权、任意插件沙箱或用户删除到所有语音出口的原子失效协议。默认原生输出已共享准入，但其内容证据与请求因果关联仍是独立的未完成边界，不因 native gate 存在而自动解决。
 
 ## 34. Extension Model
 
@@ -548,6 +552,25 @@ Memory scope 由应用构造，工具不暴露任意 user_id。个人历史经�
 
 ## 36. Future Work / Release Gates
 
-优先完成统一语音请求/响应代次与实际播放 ACK，随后补 exercise capability gate、运行库修复核验、真实端到端 tracing 与跨设备测试。必要时将不合作 provider 放入可监督进程。再开展带冻结数据集的路由/反馈策略比较和用户研究。
+V2.1 已推进响应身份、共享原生准入和取消隔离；下一步仍需可验证的请求/响应因果关联与实际播放观测协议，随后补 exercise capability gate、运行库修复核验、真实端到端 tracing 与跨设备测试。必要时将不合作 provider 放入可监督进程。再开展带冻结数据集的路由/反馈策略比较和用户研究。
 
 最终要证明的不是“架构图更完整”，而是：用户明确暂停后系统不越权继续计数，旧结果无法污染当前输出，账本缺口被诚实暴露，并且用户听到的内容能追溯到有效事实。本轮对其中一组边界提供了代码与测试，剩余门槛没有被隐藏。
+
+## 37. V2.1 实现增量与验收边界
+
+本轮新增 `ResponseWindow`，适配器网络/PCM 逻辑仍在 `qwen_duplex.py`。默认 SessionController 通过一行显式接线启用 `native_response_gate`，不让基础身份门反向依赖 Bridge、数据库或 UI。完整问题、候选方案、迁移和一手来源见 [语音技术说明](VOICE_OUTPUT_V2_1.md) 与 [ADR 0006](adr/0006-response-identity-and-native-admission.md)。
+
+| 状态/行为 | V2.1 责任与约束 | 不提供的保证 |
+|---|---|---|
+| 活动响应 | ResponseWindow 只允许1个；重复 created 幂等；外来 created 不替换当前 | 不证明创建事件对应哪次客户端请求 |
+| 退役身份 | 256项有界窗口，结束或取消后拒绝近期重放 | 不保证已淘汰 ID 永远不会再被接纳 |
+| 注入等待 | 1个 pending，创建期限4秒；新注入不覆盖 | 不保证服务端在4秒内生成 |
+| 原生回答 | 同一 arbiter 的 ANSWER lease，暂为12秒；VAD/安全抢占使 guard 失效 | 不进行 spoken claim 事实验证，不按实际语音时长续租 |
+| 取消操作 | 本地先失效，最多1个未完成 task，等待0.2秒后保守阻断 | 不代表远端已停止计费或扬声器已停止 |
+| 不确定发送/创建 | 输出隔离，记录 reason，显式新连接/会话恢复 | 不在不确定写入后自动重试旧内容 |
+| 字幕与音频 | 显式当前 ID + 同一有效性 guard | 不撤回已生成/已播放的内容 |
+| 终结状态 | completed/failed/incomplete/cancelled/unknown 分别观察 | 不以生成完成填写真实 played_at |
+
+“准入”回答能不能现在输出；“因果关联”回答它来自哪次请求；“内容验证”回答它是否忠于事实；“播放确认”回答输出是否在终端发生。这四个问题必须独立验收。当前 ordered injection candidate 继续兼容旧协议，但 feedback facts 与 receipt details 均标注 `response_correlation=unverified`，不能据此建立已经验证的 Claim→Speech 证明。
+
+新增38项测试分布于纯身份9项、原生准入9项和 SDK 事件边界20项。既有成功完成 fixture 补上明确 completed，未删除旧测试/断言；实际 CI 状态、版本与新身份门微基准见 [TEST_REPORT](TEST_REPORT.md) 的 V2.1 增补。此前18.375/38.432µs等性能数字继续表示 V2.0 固定实验，不冒充本轮新测量。

@@ -18,10 +18,11 @@ flowchart LR
   F --> Q[Guarded Qwen output]
   MIC[Microphone] --> N[Native Qwen conversation]
   Q --> B[Browser audio]
-  N --> B
+  N --> G[Native admission / same arbiter]
+  G --> Q
 ```
 
-权威计数来自本地Runtime，不来自模型口述。本轮加入暂停锁存、流边界保护、操作容量管理、受控反馈仲裁和更可靠的账本失败状态。**普通Qwen对话仍有未经过统一仲裁的路径**；模型生成结束也不代表用户已听完。详细边界见 [Architecture V2](docs/ARCHITECTURE_V2.md)。
+权威计数来自本地Runtime，不来自模型口述。本轮加入暂停锁存、流边界保护、操作容量管理、受控反馈仲裁和更可靠的账本失败状态。**V2.1 默认会话已把原生输出接入共享准入**；响应身份过滤、单 pending 注入和取消隔离同步生效。原生内容的事实验证、手动/自动请求的严格因果对应与真实播放 ACK 仍未完成；未连接 gate 的独立 adapter 仍保留兼容旁路。详细边界见 [Architecture V2](docs/ARCHITECTURE_V2.md)。
 
 ## Requirements
 
@@ -67,7 +68,7 @@ uv run --no-sync ruff check . --select E9,F63,F7,F82
 uv run --no-sync python scripts/benchmark_architecture.py --iterations 5000 --output /tmp/motion-benchmark.json
 ```
 
-实测基线91项、重构后124项全部通过；新增33项覆盖暂停/流切换、快照、writer关闭、取消、仲裁、Qwen事件竞争和pose→mock voice集成。包含本地WebRTC回环，不调用真实云模型。原始报告与测量限制见 [TEST_REPORT](docs/TEST_REPORT.md)。
+V2.0 固定基线91项、重构后124项全部通过；当轮新增33项覆盖暂停/流切换、快照、writer关闭、取消、仲裁、Qwen事件竞争和pose→mock voice集成。包含本地WebRTC回环，不调用真实云模型。V2.1 再新增38项语音边界和4项基准隔离测试，完整 CI 为166项全部通过（代码快照dc1ddd7）；本轮实际 CI 结果和固定测量见 [TEST_REPORT](docs/TEST_REPORT.md)。
 
 benchmark只测本地合成fixture，不包含摄像头、YOLO、网络模型或TTS。此次强化事实所有权增加了ingest开销，不能解释成系统全面提速。
 
@@ -85,6 +86,7 @@ coach/operations.py         未完成操作容量所有权
 coach/arbiter.py            单槽反馈准入
 coach/session_agent.py     业务触发与受控语音桥接
 coach/qwen_duplex.py        Qwen事件/取消/注入guard
+coach/voice_state.py        单响应身份与有限退役窗口
 coach/browser_edge.py       浏览器WebRTC与音频队列
 coach/memory/               账本、writer、检索、整合
 coach/mcp_server.py         受控业务工具
@@ -95,6 +97,6 @@ docs/                       技术文档、研究、ADR、迁移与证据
 
 ## Documentation
 
-[架构总说明](docs/ARCHITECTURE_V2.md) · [架构审计](docs/ARCHITECTURE_AUDIT.md) · [外部研究](docs/AGENT_ARCHITECTURE_RESEARCH.md) · [测试与性能报告](docs/TEST_REPORT.md) · [迁移与回滚](docs/ARCHITECTURE_MIGRATION.md) · [ADR](docs/adr)
+[架构总说明](docs/ARCHITECTURE_V2.md) · [V2.1语音说明](docs/VOICE_OUTPUT_V2_1.md) · [架构审计](docs/ARCHITECTURE_AUDIT.md) · [外部研究](docs/AGENT_ARCHITECTURE_RESEARCH.md) · [测试与性能报告](docs/TEST_REPORT.md) · [迁移与回滚](docs/ARCHITECTURE_MIGRATION.md) · [ADR](docs/adr)
 
 历史roadmap和设计文档保留，可能包含尚未实现的目标。遇到差异时，以实际代码、对应测试和本轮明确的限制说明为准，不把计划文档当作已上线功能。

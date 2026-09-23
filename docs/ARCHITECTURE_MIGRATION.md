@@ -79,4 +79,16 @@ git worktree add --detach ../motion-relay-main-baseline f2f104d3c280972bc9e3aecb
 
 ## 8. Known Limitations
 
-原生Qwen对话仍旁路仲裁；迟到response.created关联尚不完整；无可靠played_at；operation池只限制单owner，不能强杀线程；真正端到端latency与用户效果未测；exercise/provider插件、全链路tracing和生产存储加固未完成。
+默认会话的原生输出已接入准入，但原生内容仍未经过事实验证；手动/自动响应因果关联尚不完整；无可靠played_at；operation池只限制单owner，不能强杀线程；真正端到端latency与用户效果未测；exercise/provider插件、全链路tracing和生产存储加固未完成。
+
+## 9. V2.1 语音增量迁移
+
+从 `46a2061` 继续演进，无数据库 schema、锁文件、VAD 默认值或媒体格式变更。SessionController 已显式连接 `native_response_gate`；自行组装 provider 的代码需把这个同步准入回调接到同一 Bridge，否则独立 adapter 仍保留原生兼容路径。
+
+每个 response 相关事件必须带明确 ID，缺失 ID 不再自动指向 current。成功结束 fixture 要带 `status=completed`；failed/incomplete/cancelled 及未知分别记录。一个既有成功 fixture 补全该字段，断言不变。
+
+第二次注入不能覆盖尚未绑定的请求。发送可能成功却报错、未取得 response ID 就被打断、取消不能确认等情况会产生 `voice_output_blocked`；停止并新建测试会话，保留原因日志，不修改私有字段跳过隔离，不自动重试旧提示。0.2秒只是取消等待预算，12秒只是原生 lease 默认值，都不是真实听感指标。
+
+新的 feedback facts / receipt details 包含 `response_correlation=unverified`，表示旧协议的 ordered candidate 没有客户端因果证明。不能将它当作新事实提升到已验证的 speech attribution，也不能从 response.done 填入 played_at。完整说明见 [VOICE_OUTPUT_V2_1](VOICE_OUTPUT_V2_1.md)。
+
+回滚本增量可在独立分支 revert 本轮提交，或使用 `46a2061` 的单独 worktree。原V2.0修复和已存记录不需要删掉；回滚会重新引入本轮响应竞争问题。

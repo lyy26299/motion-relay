@@ -2,6 +2,8 @@
 
 日期：2026-09-23。本报告只将实际运行的项目标为 PASS；微基准、协议测试和真实硬件体验分开。
 
+> 版本说明：第1–12节保留 V2.0 固定实验；本轮 V2.1 实际结果、测量修复和剩余限制见第13节。
+
 ## 1. Source / Environment
 
 | 项目 | 实际值 |
@@ -160,3 +162,68 @@ memory fixture使用内存SQLite，只有5个session且无rep。它只验证harn
 必须进一步验证统一语音出口、provider请求ID与播放ACK、exercise能力绑定、SQLite引擎补丁、真实媒体/网络/磁盘负载和全链路trace。当前124项PASS不覆盖这些缺口，详细清单见审计A13–A19。
 
 常规CI会对后续文档/CI提交再运行相同suite并保存新HEAD证据；本报告的固定测量表始终对应d45ddeb，不用后续新HEAD名称冒充原测量版本。
+
+## 13. V2.1 — 响应身份、原生准入与基准隔离
+
+### 13.1 固定版本和证据
+
+增量起点 `46a2061fedebdd15c52cc4e8bd2441683ae01d14`；本轮代码/测试/基准受测快照 **`dc1ddd7fc797a760918a532888cc25d4de3c036d`**。后续仅文档提交不改这个固定测量归属。
+
+[Push CI 35847571208](https://github.com/lyy26299/motion-relay/actions/runs/35847571208) 与 [PR CI 35847574380](https://github.com/lyy26299/motion-relay/actions/runs/35847574380) 均整体 success。以下数值来自 push 工件 [10744185511](https://github.com/lyy26299/motion-relay/actions/runs/35847571208/artifacts/10744185511)。下载 ZIP 的 SHA256 为 `f48a45ea90e689298dca23980315c0ff28403514bdaa3f2c5768f0874cedcb9b`；已核对 source.zip 中代码/测试/脚本与本地实现一致。
+
+环境：Python3.13.15、uv0.12.18、Linux6.17.0-1022-azure x86_64/glibc2.39、SQLite3.45.1、vision-agents0.6.9。依赖仍由原 uv.lock 固定，没有本轮运行依赖或 schema 变更。sqlite_source_id 为 `2024-01-30 16:01:20 e876e51a0ed5c5b3126f52e532044363a014bc594cfefa87ffb5b82257ccalt1`；已记录来源，不代表供应商补丁状态已核实。
+
+### 13.2 实际命令与结果
+
+```bash
+uv sync --locked --extra dev
+uv run --no-sync python -m unittest discover -s tests -v
+uv run --no-sync python -m compileall -q coach scripts agent_local.py agent_local_agent.py
+uv run --no-sync ruff check . --select E9,F63,F7,F82
+```
+
+最终 **166/166 passed，0 failures，0 errors，0 skipped**；unittest **1.887s**，进程 wall time **12.22s**。locked sync、compileall、关键 Ruff 规则和两臂 benchmark 均通过。原124项保留，其中一个成功 response.done fixture 增加明确 `status=completed`，原断言未删除或放宽；缺失状态另测为 generation_unknown。
+
+| 新增文件 | 数量 | 覆盖 |
+|---|---:|---|
+| tests/test_voice_response_state.py | 9 | 单活动响应、重复/竞争创建、缺失/外来ID、终结重放、有界退役、非法输入 |
+| tests/test_native_output_admission.py | 9 | 原生共享仲裁、安全抢占、VAD、普通/路由转录、关闭、无数据库准入 |
+| tests/test_voice_output_boundaries.py | 20 | 固定SDK下音频/字幕/created/item/done、注入等待、发送不确定、取消超时、旧reader、关闭发送等交错 |
+| tests/test_benchmark_source_isolation.py | 4 | 文件路径与哈希、外部回退拒绝、无来源拒绝、符号链接逃逸拒绝 |
+| **合计** | **42** | **38项语音边界 + 4项测量隔离；124→166** |
+
+### 13.3 失败尝试、修复及环境限制
+
+第一次完整 run35846213087（2f08e8d）运行162项，161通过、1 error、0 failures，耗时1.908s。错误仅在新关闭测试：真实SDK会把 `_real_client` 清空，测试却关闭后从该字段访问fake。5939a225保留关闭前的client引用，继续断言只发送一次、且新增确认client.close被调用；未更改运行逻辑或削弱预期。
+
+修正后 run35846599333（5939a225）162项全通过，2.010s /13.95s wall time。但检查 benchmark-main.json 发现基线不存在的 voice_state 被环境可编辑安装回退加载。**这个 run 的测试结果有效，其性能输出不用于本轮最终对比。** dc1ddd7 增加来源验证、显式可选模块存在检查和4项测试，并重跑得到本节最终166项与新基准。详细原因见 [BENCHMARK_SOURCE_ISOLATION](BENCHMARK_SOURCE_ISOLATION.md)。
+
+本地工作容器 Python3.13.5 /uv0.10.0 的 `uv sync --locked --extra dev` 遇DNS失败；原始本地discover有6个缺失依赖导入错误，不归类为运行代码缺陷。纯身份/准入18项与源码隔离4项在本地通过。SDK形状stub的27项辅助逻辑检查不作为真实SDK证据；真正兼容性证据来自完整依赖CI。
+
+### 13.4 有来源证明的微基准
+
+同一个 job、同一脚本、同一环境，对 main=f2f104d3 与 current=dc1ddd7 分别导入。预热100次、预建pose/response ID、nearest-rank分位数。普通指标N=5000，查询N=1000，Agent abstain N=500。新JSON含 source_modules：main实际13个coach模块、current16个；每项保存相对路径与SHA256，外部源码导入会使基准失败。current模块哈希已与source.zip核对。
+
+原始测量：[main isolated](benchmarks/2026-09-23-v2.1-main-isolated.json)、[V2.1 dc1ddd7](benchmarks/2026-09-23-v2.1-dc1ddd7.json)。此前V2.0固定JSON继续保留，绝不覆盖成不同版本的数据。
+
+全部时间为 **µs**：
+
+| Metric | Main P50 | Main P95 | Main P99 | V2.1 P50 | V2.1 P95 | V2.1 P99 |
+|---|---:|---:|---:|---:|---:|---:|
+| FSM update | 6.621 | 12.503 | 12.789 | 6.601 | 12.679 | 13.020 |
+| MotionRuntime ingest | 8.712 | 15.006 | 17.415 | 17.838 | 33.919 | 39.613 |
+| WorkingMemory add_pose | 0.590 | 0.702 | 0.786 | 0.589 | 0.708 | 0.869 |
+| WorkingMemory view | 3.781 | 3.884 | 3.943 | 3.771 | 3.883 | 3.962 |
+| bounded queue roundtrip | 2.473 | 2.761 | 4.804 | 2.404 | 3.994 | 5.250 |
+| memory query：5个空session | 120.948 | 129.960 | 136.997 | 121.336 | 153.273 | 252.340 |
+| Agent abstain scheduling | 173.666 | 186.763 | 212.261 | 178.864 | 190.886 | 206.662 |
+| feedback arbitration | 未实现 | 未实现 | 未实现 | 3.314 | 3.457 | 3.868 |
+| response identity cycle | 未实现 | 未实现 | 未实现 | 2.296 | 2.494 | 2.608 |
+
+身份门cycle为 begin→accepts(audio)→finish_audio→finish；不是单个判断，更不是完整Qwen/PCM/网络路径。Main没有该模块，不计算相对提速。ingest、查询、队列部分尾延迟高于main，本轮没有证明系统整体更快。由于本轮没有改变FSM/存储算法，也不能把跨run波动归因于语音修复；代码审查与性能因果结论分开。
+
+### 13.5 未运行和剩余风险
+
+NOT RUN：真实云Qwen与当前在线协议兼容性、摄像头/MPS/麦克风扬声器AEC、端到端播放ACK及打断时延、完整Mermaid渲染、全量style lint/typecheck/coverage、多小时故障压测、用户实验。有限事件交错测试不是所有调度顺序的证明。
+
+已解决的是默认入口共享准入、已知响应ID竞争和不确定状态保守阻断。ordered injection candidate仍是unverified，原生内容未经过AgentLoop事实验证，退役窗口仅256项，原生lease12秒并非speech-duration调度，取消等待0.2秒不等于远端/扬声器已停止。并行feedback持久化更新的单调状态归并、完整关闭/重连和全进程资源上界仍需后续工作。

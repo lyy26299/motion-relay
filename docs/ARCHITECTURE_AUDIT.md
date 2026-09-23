@@ -4,6 +4,8 @@
 
 本报告区分代码事实、工程判断和未验证风险。此次交付是一轮已经实现并验证的增量重构，不是生产就绪认证，也不是对原始需求所有条目的完成声明。
 
+> 版本说明：第1–7节保留 V2.0 审计及当时实现状态；V2.1 语音增量的当前状态见第8节，不将历史“未实现”结论误作最新结论。
+
 ## 1. 审计范围与证据等级
 
 完整仓库源码已取得，不依赖空白 README 推测。针对入口、MotionRuntime、SquatFSM、WorkingMemory、AgentLoop、SessionAgentBridge、Qwen 双工适配器、后台 writer 与测试进行了重点检查和实际回归验证。MemoryStore、RetrievalService、MCP、Pose Adapter、Browser Edge、现有文档及脚本用于交叉核对；没有完成每个存储分支、第三方 SDK 和全部历史文档的逐行证明。
@@ -99,3 +101,19 @@ SQLite 来源：[官方 WAL-reset 说明](https://www.sqlite.org/wal.html#walres
 ## 7. 审查结论
 
 最关键的改善不是“有了一个 arbiter 文件”，而是：暂停有单一所有者，取消后的工作继续计入容量，输出前再次验证，账本缺口不能被后续成功覆盖。最关键的未完成项是统一实际语音出口。当前分支应作为 Draft PR 审查，不应仅凭 124 项测试就标记 production-ready。
+
+## 8. V2.1 语音输出增量审计
+
+增量起点 `46a2061`，实现 `2f08e8d`；范围限定于响应身份、原生准入、等待注入、取消及生命周期，不重复声称完成全仓库逐行审计。代码及测试对应 [VOICE_OUTPUT_V2_1](VOICE_OUTPUT_V2_1.md)。
+
+| 对应问题 | 新证据/修改 | 当前状态与剩余限制 |
+|---|---|---|
+| A06 / A13 原生旁路 | Controller 接 native gate；Bridge 同一 arbiter；原生拒绝/安全抢占/无数据库准入测试 | 默认入口输出准入已接入；原生内容证据验证仍未完成；独立 adapter 可不接 gate |
+| A07 终结语义 | 显式 completed、failed、incomplete、cancelled、unknown；缺失 ID 不回退 | 已实现相应事件处理；真实播放 ACK 仍未实现 |
+| A15 created 竞争 | ResponseWindow 单活动、重复幂等、退役256项；pending单槽、打断/不确定发送后阻断；新SDK边界测试 | 已缓解已知交错；未证明客户端请求因果；ordered candidate 标注 unverified |
+| 新 High：旧 reader / cancel 污染继任 | reader捕获client和epoch；取消先本地失效，最多一个 task，等待预算0.2秒 | 覆盖旧reader和取消不结束测试；完整SDK close/executor进程退出仍无硬保证 |
+| 新 Medium：普通final转录重复撤销 | VAD单独标记，普通final不再次中断新原生回答；路由问题仍撤销 | 覆盖常见顺序；不是完整ASR item ID关联 |
+| 新 Medium：畸形包/字幕绕过guard | 字幕与音频同guard；解析拒绝外来item、无ID、畸形Base64/非对象事件 | 已实现相应防御测试；未对任意畸形协议做穷尽fuzz |
+| A19 输出生命周期 | 原生lease暂定12秒，pending创建期限4秒，有限ID窗口 | 都是工程默认；未做speech-duration调度和真人听感验证 |
+
+可用性代价必须暴露：无法确认响应归属时保守停止输出，操作者可能需要重建会话。丢弃本地音频不等于云端停止生成/计费；全双工体验仍需真实模型与硬件验收。新38项测试结果见 TEST_REPORT 的 V2.1 记录，而非据代码审查直接宣称通过。

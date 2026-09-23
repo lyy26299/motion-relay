@@ -193,3 +193,15 @@
 冻结 fixture、硬件、Python/SQLite/SDK、模型版本、语言和测试集；将网络模型延迟与本地开销分开。用统一事件序列比较“原生直接反馈”“应用规则触发”“有界决策+仲裁”，记录无响应、过期、错误打断、重复反馈和遗漏事实。语音准确性由 claim→evidence 人工标注评估，不只看答案是否流畅。
 
 反馈优先级与 cooldown 属于待验证策略，不属于论文已经证明的最佳值。用户实验、长期坚持度和动作表现效果需要独立研究设计与适当伦理/安全审查，本轮没有这些实测结论。
+
+## 5. V2.1：响应身份不等于请求因果，接收不等于播放
+
+本轮再次核查 Qwen 官方客户端/服务端事件及 W3C WebRTC（访问2026-09-23），来源、语言页面日期与实现限制见 [VOICE_OUTPUT_V2_1 第13节](VOICE_OUTPUT_V2_1.md)。
+
+**Fact**：服务端响应带 response.id / response_id，终结有不同 status；所核查创建事件契约没有客户端请求 ID 回传承诺。客户端中文文档对 conversation.item.create 的描述与仓库固定旧 input_text 路径存在差异；未进行在线验证。WebRTC 接收/同步源观察不能单独证明接入播放 sink 或已听见。
+
+**Interpretation**：严格过滤已知 ID 可以减少竞争，但不能把“下一个响应”证明为“这次手动注入的响应”。浏览器收到RTP、服务端生成完毕与实际输出是不同观察。
+
+**Design decision**：不改默认VAD或加入未经验证的wire字段；实现有界 ResponseWindow、原生共享准入、单pending及不确定时阻断；把 ordered candidate 标为 unverified。不伪造 browser playback ACK 或 played_at。
+
+**Trade-off**：隔离提高保守性但损失可用性，ID窗口有有限保护期限；原生12秒lease与0.2秒cancel等待均需真实环境评估。下一阶段应验证单一请求发起模式或受支持的因果关联接口，再设计明确证据强度的浏览器输出观察。
