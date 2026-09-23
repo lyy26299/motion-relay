@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import platform
@@ -61,6 +62,31 @@ async def agent_measure(n: int) -> dict:
     if hasattr(loop, "close"):
         await loop.close()
     return summarize(values)
+
+
+
+def source_module_manifest(root: Path, modules=None) -> dict:
+    """Reject editable-install fallbacks outside the requested source checkout.
+
+    Run after timing so file hashing is not included in benchmark samples.
+    """
+    root = root.resolve()
+    selected = dict(sys.modules if modules is None else modules)
+    manifest = {}
+    for name, module in sorted(selected.items()):
+        if name != "coach" and not name.startswith("coach."):
+            continue
+        filename = getattr(module, "__file__", None)
+        if filename is None:
+            raise RuntimeError(f"source module has no file: {name}")
+        path = Path(filename).resolve()
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(f"benchmark imported {name} outside --source-root") from exc
+        manifest[name] = {"path": relative.as_posix(),
+                          "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return manifest
 
 
 def main():
@@ -118,12 +144,13 @@ def main():
             assert lease is not None
             arbiter.finish(lease)
         metrics["feedback_arbitration"] = measure(arbitrate, n)
-    try:
-        from coach.voice_state import ResponseWindow
-    except ImportError:
+    # Editable installation finders may fall back to the current checkout
+    # when an optional module is absent from the requested baseline tree.
+    if not (args.source_root / "coach" / "voice_state.py").is_file():
         metrics["voice_response_identity_cycle"] = {
             "available": False, "reason": "not implemented in baseline"}
     else:
+        from coach.voice_state import ResponseWindow
         window = ResponseWindow()
         response_ids = iter([f"response-{i}" for i in range(n+101)])
         def voice_identity_cycle():
@@ -135,6 +162,7 @@ def main():
         metrics["voice_response_identity_cycle"] = measure(voice_identity_cycle, n)
     result = {
         "schema_version": "coach.benchmark.v1", "source_revision": args.source_revision,
+        "source_modules": source_module_manifest(args.source_root),
         "environment": {"python": platform.python_version(), "platform": platform.platform(),
                         "machine": platform.machine(), "sqlite": sqlite3.sqlite_version},
         "method": "100 warmups, nearest-rank percentiles, prebuilt poses, perf_counter_ns",
