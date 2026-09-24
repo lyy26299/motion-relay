@@ -1,8 +1,8 @@
-# Motion Relay Architecture V2（含 V2.1 语音增量）
+# Motion Relay Architecture V2（含 V2.1 语音与 V2.2 回执增量）
 
-日期：2026-09-23。代码基线：`f2f104d3c280972bc9e3aecb75fdafe8c76a4f85`。V2.0 已验证快照：`d45ddeb76badc4f6d5ef77599cdfe9d6865d52d2`。V2.1 增量起点：`46a2061fedebdd15c52cc4e8bd2441683ae01d14`；语音实现：`2f08e8d494bce3cd1ec8b6d6c203dd38757d17b5`。
+更新日期：2026-09-24；V2.0/V2.1 记录日期为2026-09-23。代码基线：`f2f104d3c280972bc9e3aecb75fdafe8c76a4f85`。V2.0 已验证快照：`d45ddeb76badc4f6d5ef77599cdfe9d6865d52d2`。V2.1 增量起点：`46a2061fedebdd15c52cc4e8bd2441683ae01d14`；语音实现：`2f08e8d494bce3cd1ec8b6d6c203dd38757d17b5`。
 
-这是面向首次接手项目工程师的运行时说明。**本文件已同步 V2.1 实际连线；未修改的领域/存储模块沿用 V2.0。** 默认 SessionController 的原生输出已接入共享准入；原生内容的事实验证、手动/自动响应的严格因果关联、真实播放 ACK、完整 exercise 插件和生产级 tracing 仍未完成。语音详细契约见 [VOICE_OUTPUT_V2_1](VOICE_OUTPUT_V2_1.md)，关键变化见第37节。测试与基准的实测证据见 [TEST_REPORT](TEST_REPORT.md)，缺陷定位见 [AUDIT](ARCHITECTURE_AUDIT.md)，外部依据见 [RESEARCH](AGENT_ARCHITECTURE_RESEARCH.md)。
+这是面向首次接手项目工程师的运行时说明。**本文件已同步 V2.1 实际连线与 V2.2 事务回执；领域逻辑和底层存储 schema 沿用既有实现。** 默认 SessionController 的原生输出已接入共享准入；原生内容的事实验证、手动/自动响应的严格因果关联、真实播放 ACK、完整 exercise 插件和生产级 tracing 仍未完成。语音详细契约见 [VOICE_OUTPUT_V2_1](VOICE_OUTPUT_V2_1.md)，关键变化见第37节。V2.2 修复迟到回写和事务内 scope，详见第38节及 [FEEDBACK_RECEIPTS_V2_2](FEEDBACK_RECEIPTS_V2_2.md)。测试与基准的实测证据见 [TEST_REPORT](TEST_REPORT.md)，缺陷定位见 [AUDIT](ARCHITECTURE_AUDIT.md)，外部依据见 [RESEARCH](AGENT_ARCHITECTURE_RESEARCH.md)。
 
 ## 1. Problem Definition
 
@@ -54,6 +54,10 @@ flowchart LR
   N --> NA[Native response admission]
   NA -. lease check .-> F
   NA --> OG
+  OG --> OBS[Feedback observer / owned IO]
+  OBS --> FR[Scope-bound FeedbackRecorder]
+  FR --> TX[Atomic status join / MemoryStore transaction]
+  TX --> D
   N --> S
 ```
 
@@ -76,6 +80,8 @@ V2.1 中，默认 SessionController 将原生响应交给 `admit_native_response
 | `coach/qwen_duplex.py` | WebSocket、单 pending 注入、native gate、严格 ID、取消隔离 | 不把生成事件或候选绑定视为已听见/已证明因果 |
 | `coach/voice_state.py` | 单活动 ResponseWindow、256项退役窗口、幂等终结 | 不持有网络、文本、音频或客户端请求归属 |
 | `coach/browser_edge.py` | 本地 WebRTC、音频缓冲、flush、loopback 访问约束 | 尚不提供完整浏览器真实 playout ACK |
+| `coach/feedback_state.py` | 纯 delivery 状态合并，重复/乱序收敛 | 不访问 SQLite，不声称真实播放 |
+| `coach/memory/feedback.py` | 固定 scope 的事务内回执检查/合并/写入 | 不创建用户/会话/回执，不证明请求因果 |
 | `coach/memory/*` | 持久化、业务检索、确定性整合、后台写入 | 不反向创建实时动作事实 |
 
 ## 7. State Ownership
@@ -98,6 +104,7 @@ V2.1 中，默认 SessionController 将原生响应交给 `admit_native_response
 | Event ledger | LedgerWriter 提交；MemoryStore 事务所有 | exact query / consolidation | 持久化原始事件和 rep | 单 writer 线程，幂等；accepted 不等于 durable |
 | Training plan | 现有 AgentLoop 版本化 proposal 契约 | 可信应用后续决策 | 本轮无完整计划执行状态机 | LLM proposal 不直接变更动作事实 |
 | Feedback admission | FeedbackArbiter | bridge / guard | 活动 lease 1，历史 key 128，会话级 | 仅应用 loop；旧 lease 不可完成新 lease |
+| Feedback receipt | Bridge 提交观察；FeedbackRecorder 合并；MemoryStore 事务所有 | 检索/审计 | 持久化 feedback，按用户/会话/epoch | 事务内检查；旧回调不回退终态；不同 response ID 拒绝 |
 | Pending operations | OperationPool | AgentLoop / bridge | operation 真正结束才释放 | caller 取消后仍计入容量 |
 
 ## 8. Data Flow：一次动作
@@ -408,6 +415,8 @@ SQLite schema、幂等 event/rep IDs、事务、WAL/NORMAL 配置本轮未改。
 
 生产前检查 SQLite 实际引擎版本与供应商修复，见 audit A17；仅升级 Python 包依赖并不足以证明引擎已修复。备份运行中的数据库不能只随意复制主文件并丢弃 WAL，需使用正确备份流程。
 
+V2.2 另将 response observer 回执作为独立写入能力：Bridge→有界 IO worker→FeedbackRecorder→同一 MemoryStore 事务。它不复用高频 fact batch 队列，也不创建第二个权威动作账本；详细状态、scope、取消和不可靠投递边界见第38节。
+
 ## 24. Evidence Architecture
 
 Claim 的数据链应为：实际 rep/event → source ID/revision/规则版本/frame range → tool evidence envelope → 被准入的 EvidenceRef → decision → actor receipt。模型引用一个未被准入的 ID 不会使它成为可信证据。
@@ -494,7 +503,7 @@ flowchart TD
 
 ## 30. Observability：已实现与目标
 
-已实现基础：PoseSnapshot.processing_ms；Agent/feedback 的 ID、状态与证据；arbiter admission/rejection counters；operation pending/high_water/rejected；writer accepted/saved/rejected；结构化 logging extra；CI source/revision/environment/test/benchmark artifacts。
+已实现基础：PoseSnapshot.processing_ms；Agent/feedback 的 ID、状态与证据；arbiter admission/rejection counters；operation pending/high_water/rejected；writer accepted/saved/rejected；结构化 logging extra；CI source/revision/environment/test/benchmark artifacts。V2.2 增加固定原因 feedback_metrics，分别记录状态推进、重复/回退丢弃、scope/ID冲突、容量、取消等待和提交未确认；不是完整提交审计日志。
 
 **待实现完整 tracing**：统一 capture、pose received/inference finished、FSM/event created、scheduled/started、retrieval、LLM request/TTFT/completion、arbiter、TTS request/first packet、playback start/end、interruption spans，并携带 session/turn/event/correlation ID。
 
@@ -522,7 +531,7 @@ V2.0 固定实验的 Motion ingest P95 从18.375µs变为38.432µs，代价来�
 
 核心 invariant：显式暂停时不增加 rep；旧 epoch 不覆盖新 epoch；模型输出不能增加权威计数；取消/过期 turn 不能有效注入；低优先级不能覆盖 safety lease；旧 done 不能结束新 feedback；scope 不由模型选择；writer 完整性失败不可被后续 saved 覆盖。
 
-有限 fixture 测试不是形式化证明。随机化跨层 interleaving、多小时压力、网络黑洞、磁盘满/断电恢复、用户实验与最终语义评测均仍待补。
+V2.2 增加33项回执测试：10态 join 的交换/结合/幂等穷举、24种观察排列、跨连接事务、epoch重建、取消后的 worker 和播放证据保留。有限 fixture 测试不是整个系统的形式化证明。随机化跨层 interleaving、多小时压力、网络黑洞、磁盘满/断电恢复、用户实验与最终语义评测均仍待补。
 
 ## 33. Failure Modes / Security / Scope
 
@@ -574,3 +583,30 @@ V2.1 已推进响应身份、共享原生准入和取消隔离；下一步仍需
 “准入”回答能不能现在输出；“因果关联”回答它来自哪次请求；“内容验证”回答它是否忠于事实；“播放确认”回答输出是否在终端发生。这四个问题必须独立验收。当前 ordered injection candidate 继续兼容旧协议，但 feedback facts 与 receipt details 均标注 `response_correlation=unverified`，不能据此建立已经验证的 Claim→Speech 证明。
 
 新增38项测试分布于纯身份9项、原生准入9项和 SDK 事件边界20项。既有成功完成 fixture 补上明确 completed，未删除旧测试/断言；实际 CI 状态、版本与新身份门微基准见 [TEST_REPORT](TEST_REPORT.md) 的 V2.1 增补。此前18.375/38.432µs等性能数字继续表示 V2.0 固定实验，不冒充本轮新测量。
+
+
+## 38. V2.2 反馈回执：单调状态与事务内 scope
+
+本增量从 V2.1 `fb4c3b1` 继续；实现 `1741b457`，基准快照 `b67a03c2`。没有更换框架、数据库 schema、Qwen SDK、VAD或动作算法。对应 [技术说明/审计/研究/迁移](FEEDBACK_RECEIPTS_V2_2.md)、[ADR0007](adr/0007-monotonic-feedback-receipts.md) 与 TEST_REPORT 第14节。
+
+### 原始错误与依赖方向
+
+旧 feedback_state 将 observer 分别放入线程池，迟到 queued 能把 interrupted 改回 queued/unknown。现在 Bridge 只提交观察；纯 `merge_feedback_status` 定义状态 join；固定 user/session/memory_epoch 的 FeedbackRecorder 在 MemoryStore.transaction 内检查权限、读取现值、校验 response_id、合并后写入。SQLite 仍由 MemoryStore 所有，FSM/Agent 不新增数据库实现依赖。
+
+### 三类证据不能混为一谈
+
+| 状态/证据 | 现在保证 | 仍不保证 |
+|---|---|---|
+| Delivery status | 旧进度不覆盖终态，重复幂等；矛盾具体终态为 delivery_conflict | 不是所有 observer 都保证到达；不是完整历史事件日志 |
+| Response identity | 首次非空 ID 绑定，不同非空 ID 拒绝，None 不清空 | 不证明注入与 response 的因果；unverified 标记保留 |
+| Physical playback | 生成回调不写 played_at/acknowledged_at，不重置已有可信播放证据 | 没有新增浏览器 ACK 或扬声器测量 |
+
+进度链为 accepted→queued→generated→generation_unknown；已知终态细化 unknown，互相矛盾则变成 delivery_conflict。interrupted 是 delivery invalidation 吸收态，不是“从未生成”或“远端已经停止”。只对同一反馈、相同已绑定 response ID 的状态集合谈顺序无关；不能将不同响应混为一个集合。
+
+### 事务与生命周期
+
+user epoch、session epoch、receipt session 以及 response ID 都在同一个 BEGIN IMMEDIATE 事务里检查，不能先在线程外检查 scope 再盲写。删除后同名重建不会恢复旧 recorder 权限；结束而未删除、epoch未变的 session 仍可接受迟到观察。低层 legacy update_feedback 保留给可信调用，不自动获得新保证。
+
+Bridge IO容量仍为4；observer异步上限仍为16。等待取消后工作线程继续由 OperationPool 持有；0.5秒超时记录为 commit_wait_timeout，不宣称数据库已回滚。已经提交的观察按 join 合并；未投递、容量拒绝或关闭时丢掉的观察仍可能使记录不完整，这需要后续日志/outbox协议。
+
+新状态 delivery_conflict 应被展示为冲突，不得计为成功。无 schema 迁移；保留旧记录和低层接口。回滚仅在独立分支 revert 本次提交，不force push、不删数据。回执基准度量额外事务检查成本，不作为端到端语音加速或产品安全证据。

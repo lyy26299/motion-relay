@@ -1,8 +1,8 @@
 # Architecture V2 — Test and Benchmark Report
 
-日期：2026-09-23。本报告只将实际运行的项目标为 PASS；微基准、协议测试和真实硬件体验分开。
+更新日期：2026-09-24；历史实验日期保留。本报告只将实际运行的项目标为 PASS；微基准、协议测试和真实硬件体验分开。
 
-> 版本说明：第1–12节保留 V2.0 固定实验；本轮 V2.1 实际结果、测量修复和剩余限制见第13节。
+> 版本说明：第1–12节保留 V2.0 固定实验；V2.1 实际结果、测量修复和剩余限制见第13节；V2.2 单调回执增量见第14节。
 
 ## 1. Source / Environment
 
@@ -227,3 +227,75 @@ uv run --no-sync ruff check . --select E9,F63,F7,F82
 NOT RUN：真实云Qwen与当前在线协议兼容性、摄像头/MPS/麦克风扬声器AEC、端到端播放ACK及打断时延、完整Mermaid渲染、全量style lint/typecheck/coverage、多小时故障压测、用户实验。有限事件交错测试不是所有调度顺序的证明。
 
 已解决的是默认入口共享准入、已知响应ID竞争和不确定状态保守阻断。ordered injection candidate仍是unverified，原生内容未经过AgentLoop事实验证，退役窗口仅256项，原生lease12秒并非speech-duration调度，取消等待0.2秒不等于远端/扬声器已停止。并行feedback持久化更新的单调状态归并、完整关闭/重连和全进程资源上界仍需后续工作。
+
+
+## 14. V2.2 单调反馈回执增量（2026-09-24）
+
+### 14.1 固定起点与实际运行环境
+
+本次继续已有 Draft PR #1，不重新创建空分支。开始 main 仍为 `f2f104d3c280972bc9e3aecb75fdafe8c76a4f85`；V2.1 起点为 `fb4c3b1b104accc144fdb547b878cfa800682fe4`。从其 CI run35848471670 下载源码工件，核对全部99个源码文件的 Git blob SHA，与清单零差异后再修改。
+
+实现提交 `1741b4574aa12ec3b7eb138cc729d9766c01c020`；本节固定测试/基准提交 `b67a03c204fbd121825983a021bf55a1dccdce6d`。之后文档与实测JSON提交不修改实现，不能把本节数据重新标成另一个测量快照。
+
+| 环境 | 实际结果 / 限制 |
+|---|---|
+| 本地 Python | 3.13.5；网络/DNS不可用，非完整项目依赖环境 |
+| 本地 baseline locked sync | `uv sync --locked --extra dev` 失败于依赖下载；不是代码失败 |
+| 本地 baseline discovery | 108项，101通过，7个模块导入错误；缺少getstream/媒体SDK依赖 |
+| 本地新增定向测试 | 33通过，0失败/错误/跳过，0.129秒 |
+| 本地最终 discovery | 141项，134通过，同样7个导入错误；0.840秒；不冒充全量SDK验证 |
+| 完整 CI | Python3.13.15、uv0.12.18、SQLite3.45.1、Linux x86_64 |
+| 锁定依赖 | vision-agents0.6.9、mcp1.29.1、aiortc1.14.0、av16.1.0；锁文件未改 |
+| CI lint | Ruff0.16.6，E9/F63/F7/F82 |
+
+修改前已在原始源码复现 `generated→interrupted→迟到queued` 将 status/playback_state 改回 queued/unknown。低层兼容API未改，因此新benchmark仍能保留缺陷对照；默认Bridge改为调用新能力。
+
+### 14.2 完整 CI 结果与证据
+
+[固定 push CI 35973634675](https://github.com/lyy26299/motion-relay/actions/runs/35973634675)，job107548863336：**199 passed，0 failures，0 errors，0 skipped**；unittest2.084秒，进程wall time12.95秒。锁定依赖同步、compileall、关键Ruff、git diff检查、通用main/current基准与回执V2.1/current基准全部通过。[对应PR CI 35973639079](https://github.com/lyy26299/motion-relay/actions/runs/35973639079) 的所有步骤也成功。
+
+[工件10796629200](https://github.com/lyy26299/motion-relay/actions/runs/35973634675/artifacts/10796629200) 的ZIP SHA256为 `e9b6313f20131456db3bd84383d3b5cf71b6617b383ec22a8392f9972fc5b8c7`。实际下载核对：源码与本地实现相同，仅有尚待提交的README/架构文档文字不同；新代码、旧代码和测试均无差异。远端源码树 `b256da61abccc2606989ca7c3f7417370ab33f63` 与本地已验证代码树也完全一致。
+
+新增33项是6个状态代数、18个存储、2个双连接竞争、7个异步Bridge测试。原有166项测试未删除、未修改。10态全部100个有序对、1000个有序三元组及24种观察排列包含在上述测试方法中，不额外虚增测试数量。
+
+两个回执benchmark的source manifest分别有6个V2.1模块、8个V2.2模块，已逐一与对应source.zip内容SHA256核对；当前通用benchmark16模块也匹配。V2.1正确将新guarded模块报告为不可用，没有editable安装回退。
+
+### 14.3 回执 invariant 与成本
+
+同一job、同一harness、100预热+1000计时样本；单位均为微秒。cycle执行三次观察：generated→interrupted→queued；回执在计时前创建。
+
+| 路径 | P50 | P95 | P99 | 终态回退次数（含预热，共1100） |
+|---|---:|---:|---:|---:|
+| V2.1 legacy三观察 |115.788|143.722|202.362|1100|
+| V2.2保留的legacy三观察 |115.388|143.991|168.919|1100|
+| V2.2 guarded三观察 |325.485|358.808|384.806|0|
+| V2.2纯状态join |0.321|0.351|0.380|不适用|
+
+原始数据：[V2.1回执JSON](benchmarks/2026-09-24-feedback-v21.json)、[V2.2回执JSON](benchmarks/2026-09-24-feedback-v22.json)。legacy与guarded语义不同，不能称公平速度竞赛。guarded增加scope与事务检查，成本更高；本轮收益是修复可重复的不变量违例，不是提速。循环样本是固定对抗序列，不代表真实生产错误率。
+
+### 14.4 通用架构回归微基准
+
+[main JSON](benchmarks/2026-09-24-benchmark-main.json)、[V2.2 JSON](benchmarks/2026-09-24-benchmark-v2.json)，同一固定CI。大多数n=5000；检索n=1000；Agent n=500；各100预热。
+
+| 指标（µs） | main P95 | V2.2 P50 | V2.2 P95 | V2.2 P99 |
+|---|---:|---:|---:|---:|
+| FSM update |14.678|7.434|13.997|14.908|
+| MotionRuntime ingest |18.556|20.880|39.565|54.192|
+| WorkingMemory view |4.148|4.048|4.117|4.188|
+| bounded queue往返 |2.805|2.674|2.755|2.816|
+| memory query，5空session |164.952|140.315|165.843|173.658|
+| Agent abstain scheduling |345.473|216.088|243.170|267.996|
+| Feedback arbitration |N/A|3.647|3.787|4.589|
+| Response identity cycle |N/A|2.655|2.776|2.975|
+
+main→V2.2包含先前V2.0/V2.1改动，不能把差异归因为本次recorder。单次合成测量也不足以宣称普遍加速或回归；尤其ingest高于main，不能包装为全系统优化提速。
+
+### 14.5 已测与未测边界
+
+已测：状态收敛、旧回调不能回退终态、事务异常回滚、双连接竞争、scope删除/同名重建、response ID冲突、可信播放fixture保留、取消等候后的工作线程、容量/超时/错误分类、全量既有测试与本地函数开销。
+
+NOT RUN：真实Qwen/API、摄像头/麦克风/扬声器、真实播放ACK/AEC/听感、设备端到端延迟、磁盘压力/断电/满盘、所有跨进程/多会话交错、用户表现与坚持度、SQLite供应商补丁核验。已有WebRTC本地回环通过，不等于真实声学验收。
+
+关键剩余风险：observer/IO容量拒绝仍可能遗失回执；无持久化观察日志/outbox；timeout不证明没提交；legacy API仍可绕过；已绑定ID不证明请求因果；原生内容未验证；没有真正played_at；所有输出的删除即时撤销和全局shutdown上界未完成。
+
+对应架构、设计比较、外部来源与迁移见 [FEEDBACK_RECEIPTS_V2_2](FEEDBACK_RECEIPTS_V2_2.md)；主架构文档第38节也已同步。保持Draft，不自动合并。
