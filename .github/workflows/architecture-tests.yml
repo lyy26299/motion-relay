@@ -71,6 +71,17 @@ jobs:
           uv run --no-sync python scripts/benchmark_architecture.py \
             --source-root "$PWD" --source-revision "$(git rev-parse HEAD)" \
             --iterations 5000 --output artifacts/benchmark-v2.json
+      - name: Compare receipt invariants on V2.1 and current source
+        run: |
+          mkdir -p /tmp/motion-v21
+          git archive fb4c3b1b104accc144fdb547b878cfa800682fe4 | tar -x -C /tmp/motion-v21
+          uv run --no-sync python -m scripts.benchmark_feedback \
+            --source-root /tmp/motion-v21 \
+            --source-revision fb4c3b1b104accc144fdb547b878cfa800682fe4 \
+            --iterations 1000 --output artifacts/feedback-v21.json
+          uv run --no-sync python -m scripts.benchmark_feedback \
+            --source-root "$PWD" --source-revision "$(git rev-parse HEAD)" \
+            --iterations 1000 --output artifacts/feedback-v22.json
       - name: Upload source and verification evidence even on failure
         if: always()
         uses: actions/upload-artifact@v4
