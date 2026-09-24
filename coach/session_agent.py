@@ -13,6 +13,7 @@ import asyncio
 import logging
 import json
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -28,11 +29,12 @@ from coach.agent_loop import (
     ToolContext,
     ToolResult,
 )
+from coach.memory.feedback import FeedbackRecorder
 from coach.memory.retrieval import RetrievalService
-from coach.memory.store import MemoryStore
+from coach.memory.store import MemoryStore, NotFoundError, ScopeError
 from coach.mcp_server import MCPMemoryDispatcher
 from coach.arbiter import FeedbackArbiter, FeedbackKind
-from coach.operations import OperationPool
+from coach.operations import OperationCapacityError, OperationPool
 from coach.models import CoachEvent
 from coach.runtime import MotionRuntime
 from coach.working_memory import WorkingMemory
@@ -97,6 +99,10 @@ class SessionAgentBridge:
         # Snapshot epoch for pure in-loop checkpoints. Actual storage epochs
         # are checked off-loop before an answer is sent; tools also carry one.
         self._memory_epoch = store.get_memory_epoch(self.user_id)
+        self.feedback_recorder = FeedbackRecorder(
+            store, self.user_id, self.session_id, self._memory_epoch,
+        )
+        self.feedback_metrics: Counter[str] = Counter()
         self._results_by_turn: dict[str, tuple[ToolResult, ...]] = {}
         self._trigger_text_by_turn: dict[str, str] = {}
         retrieval = RetrievalService(store, self.user_id)
@@ -444,12 +450,35 @@ class SessionAgentBridge:
     ) -> None:
         if not feedback_id or self._closed:
             return
-        # Provider generation completion is NOT speaker playback completion.
-        await self._io(
-            self.store.update_feedback, self.user_id, feedback_id,
-            status=state, playback_state="interrupted" if state == "interrupted" else "unknown",
-            response_id=response_id,
-        )
+        # Observers can race after cancellation or finish out of order. Merge
+        # inside the storage transaction; a lock around asyncio callbacks would
+        # not fence an already-running worker or another SQLite connection.
+        try:
+            update = await self._io(self.feedback_recorder.apply, feedback_id, state, response_id)
+        except asyncio.CancelledError:
+            self.feedback_metrics["wait_cancelled"] += 1
+            raise  # The owned worker may still commit; do not claim rollback.
+        except ScopeError:
+            self.feedback_metrics["scope_rejected"] += 1
+            LOGGER.warning("feedback_scope_rejected", extra={"component": "feedback"})
+        except (ValueError, NotFoundError):
+            self.feedback_metrics["invalid_observation"] += 1
+            LOGGER.warning("feedback_observation_invalid", extra={"component": "feedback"})
+        except OperationCapacityError:
+            self.feedback_metrics["capacity_rejected"] += 1
+            LOGGER.warning("feedback_capacity_rejected", extra={"component": "feedback"})
+        except TimeoutError:
+            self.feedback_metrics["commit_wait_timeout"] += 1
+            LOGGER.warning("feedback_commit_unconfirmed", extra={"component": "feedback"})
+        except Exception:
+            self.feedback_metrics["storage_error"] += 1
+            raise
+        else:
+            self.feedback_metrics[update.reason] += 1
+            if update.reason in {"response_id_conflict", "outcome_conflict", "unmanaged_existing_status"}:
+                LOGGER.warning("feedback_observation_conflict", extra={
+                    "component": "feedback", "status": update.reason,
+                })
 
 
 __all__ = ["SessionAgentBridge"]
