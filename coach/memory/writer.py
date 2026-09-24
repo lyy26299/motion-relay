@@ -9,6 +9,8 @@ is committed in the same transaction as its ``rep_completed`` event.
 from __future__ import annotations
 
 import queue
+import copy
+import time
 import threading
 from collections.abc import Callable
 from contextlib import suppress
@@ -59,6 +61,12 @@ class LedgerWriter:
         self._thread: threading.Thread | None = None
         self._error: BaseException | None = None
         self._close_status = "completed"
+        self._admission_lock = threading.Lock()
+        self._closing = threading.Event()
+        self._integrity_failed = False
+        self.accepted_batches = 0
+        self.saved_batches = 0
+        self.rejected_batches = 0
 
     @property
     def status(self) -> WriteStatus:
@@ -75,6 +83,8 @@ class LedgerWriter:
         return self._error
 
     def _set_status(self, status: WriteStatus, detail: str = "") -> None:
+        if self._integrity_failed:
+            status, detail = "failed", "账本存在未保存批次，禁止声明完整保存"
         with self._status_lock:
             self._status = status
             self._detail = detail
@@ -102,37 +112,42 @@ class LedgerWriter:
         events: tuple[CoachEvent, ...] = (),
         reps: tuple[RepRecord, ...] = (),
     ) -> bool:
-        """Enqueue a batch and return false if the bounded queue is full."""
-
+        """Nonblocking admission; closing and overflow never report acceptance."""
         if not events and not reps:
             return True
-        if self._thread is None or self._stopped.is_set() or self.status in {"failed", "closed"}:
-            self._set_status("failed", "账本 writer 未运行")
-            return False
-        batch = FactBatch(tuple(events), tuple(reps))
-        try:
-            self._queue.put_nowait(batch)
-        except queue.Full:
-            self._set_status("failed", "账本队列已满，事实未确认落盘")
-            return False
+        with self._admission_lock:
+            if (
+                self._thread is None or self._closing.is_set() or self._stopped.is_set()
+                or self._integrity_failed or self._error is not None
+            ):
+                self.rejected_batches += 1
+                return False
+            batch = FactBatch(copy.deepcopy(tuple(events)), tuple(reps))
+            try:
+                self._queue.put_nowait(batch)
+            except queue.Full:
+                self.rejected_batches += 1
+                self._integrity_failed = True
+                self._error = RuntimeError("ledger_queue_overflow")
+                self._set_status("failed", "账本队列已满")
+                return False
+            self.accepted_batches += 1
         self._set_status("queued", f"待写入 {self._queue.qsize()} 批")
         return True
 
     def close(self, *, status: str = "completed", timeout: float = 8.0) -> None:
+        """Close admission, then drain accepted batches within one wait budget."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._admission_lock:
+            self._close_status = str(status).strip() or "completed"
+            self._closing.set()
         thread = self._thread
         if thread is None or self._stopped.is_set():
             return
-        status = str(status).strip() or "completed"
-        with self._status_lock:
-            self._close_status = status
-        # The sentinel is queued after all accepted batches, so normal close
-        # drains durable facts before marking the session finished.
-        try:
-            self._queue.put(None, timeout=max(0.1, float(timeout)))
-        except queue.Full:
-            self._set_status("failed", "关闭时无法排空账本队列")
-        thread.join(max(0.1, float(timeout)))
+        thread.join(max(0.0, deadline - time.monotonic()))
         if thread.is_alive():
+            self._integrity_failed = True
+            self._error = TimeoutError("ledger_close_timeout")
             self._set_status("failed", "账本 writer 关闭超时")
 
     def _run(self) -> None:
@@ -149,16 +164,22 @@ class LedgerWriter:
             self._set_status("ready", "账本已连接")
             self._ready.set()
             while True:
-                batch = self._queue.get()
+                try:
+                    batch = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    if self._closing.is_set():
+                        break
+                    continue
                 try:
                     if batch is None:
                         break
                     self._set_status("writing", f"写入 {len(batch.events)} 个事件")
                     self._write_batch(store, batch)
+                    self.saved_batches += 1
                     self._set_status("saved", "事实已落盘")
                 finally:
                     self._queue.task_done()
-            status = self._close_status
+            status = "interrupted" if self._integrity_failed else self._close_status
             store.finish_session(self.user_id, self.session_id, status=status)
             self._set_status(
                 "closed",

@@ -1,0 +1,91 @@
+name: Architecture tests
+
+on:
+  push:
+    branches: ["research/agent-architecture-v2", "research/agent-architecture-v2-*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+concurrency:
+  group: architecture-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UV_NO_PROGRESS: "1"
+      RUN_LIVE_QWEN_TESTS: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Record source and environment
+        run: |
+          mkdir -p artifacts
+          git rev-parse HEAD > artifacts/commit.txt
+          git ls-tree -r --long HEAD > artifacts/tree.txt
+          git archive --format=zip HEAD -o artifacts/source.zip
+          python --version | tee artifacts/python.txt
+          uname -a > artifacts/platform.txt
+          python -m pip install uv==0.12.18
+          uv --version | tee artifacts/uv.txt
+      - name: Sync locked project and development tools
+        run: uv sync --locked --extra dev 2>&1 | tee artifacts/sync.log
+      - name: Record installed dependencies and SQLite runtime
+        if: always()
+        run: |
+          uv pip freeze > artifacts/installed.txt 2>&1
+          uv run --no-sync python -c "import sqlite3; print(sqlite3.sqlite_version); c=sqlite3.connect(':memory:'); print(c.execute('select sqlite_source_id()').fetchone()[0])" > artifacts/sqlite.txt
+      - name: Run deterministic tests without cloud credentials or camera
+        run: |
+          /usr/bin/time -f 'elapsed_seconds=%e' -o artifacts/test-time.txt \
+            uv run --no-sync python -m unittest discover -s tests -v \
+            2>&1 | tee artifacts/tests.log
+      - name: Compile sources and check critical lint errors
+        run: |
+          uv run --no-sync python -m compileall -q coach scripts agent_local.py agent_local_agent.py
+          uv run --no-sync ruff check . --select E9,F63,F7,F82 2>&1 | tee artifacts/lint.log
+          git diff --check
+      - name: Compare local benchmark harness on baseline and current source
+        run: |
+          mkdir -p /tmp/motion-baseline
+          git archive f2f104d3c280972bc9e3aecb75fdafe8c76a4f85 | tar -x -C /tmp/motion-baseline
+          uv run --no-sync python scripts/benchmark_architecture.py \
+            --source-root /tmp/motion-baseline \
+            --source-revision f2f104d3c280972bc9e3aecb75fdafe8c76a4f85 \
+            --iterations 5000 --output artifacts/benchmark-main.json
+          uv run --no-sync python scripts/benchmark_architecture.py \
+            --source-root "$PWD" --source-revision "$(git rev-parse HEAD)" \
+            --iterations 5000 --output artifacts/benchmark-v2.json
+      - name: Compare receipt invariants on V2.1 and current source
+        run: |
+          mkdir -p /tmp/motion-v21
+          git archive fb4c3b1b104accc144fdb547b878cfa800682fe4 | tar -x -C /tmp/motion-v21
+          uv run --no-sync python -m scripts.benchmark_feedback \
+            --source-root /tmp/motion-v21 \
+            --source-revision fb4c3b1b104accc144fdb547b878cfa800682fe4 \
+            --iterations 1000 --output artifacts/feedback-v21.json
+          uv run --no-sync python -m scripts.benchmark_feedback \
+            --source-root "$PWD" --source-revision "$(git rev-parse HEAD)" \
+            --iterations 1000 --output artifacts/feedback-v22.json
+      - name: Upload source and verification evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: architecture-evidence-${{ github.run_id }}-${{ github.sha }}
+          path: artifacts/
+          retention-days: 14

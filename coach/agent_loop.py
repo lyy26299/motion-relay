@@ -31,6 +31,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol
 
+from coach.operations import OperationPool
 from coach.working_memory import WorkingMemory, WorkingMemoryView
 
 CoachAction = Literal["answer", "cue", "propose_plan", "ask_clarification", "abstain"]
@@ -505,6 +506,12 @@ class AgentLoop:
         self.id_factory = id_factory or (lambda: uuid.uuid4().hex)
         self._active_lock = asyncio.Lock()
         self._active: _TurnControl | None = None
+        self.operations = OperationPool(max_pending=max(8, self.config.max_total_tools + 2))
+
+    async def close(self, timeout_s: float = 0.05) -> int:
+        """Invalidate the turn and report work that could not be stopped in time."""
+        await self.cancel_active("loop_closed")
+        return await self.operations.close(timeout_s)
 
     @property
     def active_turn_id(self) -> str | None:
@@ -856,45 +863,30 @@ class AgentLoop:
         timeout_s: float | None = None,
     ) -> Any:
         self._checkpoint(control, basis)
-        operation = asyncio.create_task(_invoke(callback, *args))
-        cancellation = asyncio.create_task(control.cancelled.wait())
         remaining = control.deadline_mono - self.clock()
         if timeout_s is not None:
             remaining = min(remaining, timeout_s)
         if remaining <= 0:
-            operation.cancel()
-            cancellation.cancel()
             raise _TurnAborted("timeout", "turn_deadline_exceeded")
+        operation = self.operations.start(callback, *args)
+        cancellation = asyncio.create_task(control.cancelled.wait())
         try:
             done, _ = await asyncio.wait(
                 {operation, cancellation}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
             )
+            # Invalidation wins a simultaneous completion/cancellation race.
+            self._checkpoint(control, basis)
             if cancellation in done:
-                operation.cancel()
-                with suppress(BaseException):
-                    await operation
                 raise _TurnAborted(control.abort_status, control.abort_reason)
             if operation in done:
-                cancellation.cancel()
-                with suppress(asyncio.CancelledError):
-                    await cancellation
-                result = await operation
-                self._checkpoint(control, basis)
-                return result
-            operation.cancel()
-            with suppress(BaseException):
-                await operation
-            if self.clock() >= control.deadline_mono:
-                raise _TurnAborted("timeout", "turn_deadline_exceeded")
+                return operation.result()
             raise TimeoutError("operation_timeout")
-        except asyncio.CancelledError:
-            operation.cancel()
-            cancellation.cancel()
-            with suppress(BaseException):
-                await operation
-            raise
         finally:
             cancellation.cancel()
+            if not operation.done():
+                self.operations.cancel(operation)
+            # Do not await an uncooperative operation here. Its owner retains it
+            # and bounds future admission until the operation actually exits.
 
     def _validate_retrieval_draft(self, draft: DecisionDraft, tools_used: int) -> None:
         if draft.action is not None:
