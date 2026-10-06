@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from collections.abc import Callable
 
 from coach.exercises.squat import SquatFSM, SquatThresholds
@@ -35,6 +36,7 @@ class MotionRuntime:
         self._last_observed_at: float | None = None
         self._watchdog_emitted = False
         self._last_motion: MotionSnapshot | None = None
+        self._application_paused = False
 
     def ingest(
         self, snapshot: PoseSnapshot
@@ -45,11 +47,24 @@ class MotionRuntime:
         if order <= self._last_order:
             current = self.fsm_snapshot()
             return current, (), ()
+        if self._last_observed_at is not None and order[0] > self._last_order[0]:
+            self.fsm.pause()  # Never stitch a partial rep across camera epochs.
         self._last_order = order
         self._last_observed_at = snapshot.observed_at
         self._watchdog_emitted = False
         self.memory.add_pose(snapshot)
-        motion, events, reps = self.fsm.update(snapshot)
+        if self._application_paused:
+            motion = replace(
+                self.fsm_snapshot(observed_at=snapshot.observed_at, paused=True),
+                frame_id=snapshot.frame_id,
+            )
+            events, reps = (), ()
+        else:
+            motion, events, reps = self.fsm.update(snapshot)
+            if not motion.paused and self.memory.pause_reason in {
+                "frame_timeout", "motion_runtime"
+            }:
+                self.memory.resume()
         self._last_motion = motion
         self.memory.add_motion(motion, events, reps)
         self._emit(events, reps)
@@ -76,7 +91,8 @@ class MotionRuntime:
             evidence_end_frame=self._last_order[1],
             facts={"reason": "frame_timeout", "timeout_s": timeout_s},
         )
-        self.memory.pause("frame_timeout")
+        if not self._application_paused:
+            self.memory.pause("frame_timeout")
         paused_motion = self.fsm_snapshot(observed_at=now, paused=True)
         self._last_motion = paused_motion
         self.memory.add_motion(paused_motion, (event,), ())
@@ -84,6 +100,7 @@ class MotionRuntime:
         return (event,)
 
     def resume(self) -> None:
+        self._application_paused = False
         self.memory.resume()
 
     def pause(self, reason: str) -> MotionSnapshot:
@@ -98,6 +115,7 @@ class MotionRuntime:
         reason = str(reason).strip()
         if not reason:
             raise ValueError("Pause reason is required")
+        self._application_paused = True
         self.fsm.pause()
         self.memory.pause(reason)
         motion = self.fsm_snapshot(observed_at=time.monotonic(), paused=True)

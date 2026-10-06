@@ -183,7 +183,11 @@ class SquatFSM:
         return sum(values) / len(values) if values else None
 
     def _complete_rep(self, snapshot: PoseSnapshot) -> RepRecord:
-        start = self._rep_started_at or snapshot.observed_at
+        start = (
+            self._rep_started_at
+            if self._rep_started_at is not None
+            else snapshot.observed_at
+        )
         duration_ms = max(0.0, (snapshot.observed_at - start) * 1000)
         ratio = self._usable / self._samples if self._samples else 0.0
         reasons: list[str] = []

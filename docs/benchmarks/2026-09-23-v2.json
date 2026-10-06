@@ -1,0 +1,18 @@
+{
+  "schema_version": "coach.benchmark.v1",
+  "source_revision": "d45ddeb76badc4f6d5ef77599cdfe9d6865d52d2",
+  "environment": {"python": "3.13.15", "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39", "machine": "x86_64", "sqlite": "3.45.1"},
+  "method": "100 warmups, nearest-rank percentiles, prebuilt poses, perf_counter_ns",
+  "limitations": ["synthetic local microbenchmark", "no camera/inference/network/LLM/TTS", "SQLite in-memory fixture has five sessions and no reps", "not a user experiment or production latency guarantee"],
+  "metrics": {
+    "clock_and_callable_overhead": {"n": 5000, "unit": "us", "p50": 0.091, "p95": 0.101, "p99": 0.12, "mean": 0.095388, "measured_calls_per_second": 10483498.9726171},
+    "fsm_update": {"n": 5000, "unit": "us", "p50": 7.423, "p95": 14.136, "p99": 17.502, "mean": 8.442015399999999, "measured_calls_per_second": 118455.12624864439},
+    "motion_ingest": {"n": 5000, "unit": "us", "p50": 20.348, "p95": 38.432, "p99": 52.228, "mean": 22.0300622, "measured_calls_per_second": 45392.51822902252},
+    "working_memory_add_pose": {"n": 5000, "unit": "us", "p50": 0.671, "p95": 0.782, "p99": 0.912, "mean": 0.6969314, "measured_calls_per_second": 1434861.4512131324},
+    "working_memory_view": {"n": 5000, "unit": "us", "p50": 4.167, "p95": 4.268, "p99": 4.91, "mean": 4.2316486, "measured_calls_per_second": 236314.51817620208},
+    "bounded_queue_roundtrip": {"n": 5000, "unit": "us", "p50": 2.625, "p95": 2.705, "p99": 2.765, "mean": 2.655719, "measured_calls_per_second": 376545.8619680772},
+    "memory_query_training_5_empty_sessions": {"n": 1000, "unit": "us", "p50": 137.658, "p95": 162.435, "p99": 171.331, "mean": 142.16930499999998, "measured_calls_per_second": 7033.867120613695},
+    "agent_abstain_scheduling": {"n": 500, "unit": "us", "p50": 218.178, "p95": 256.33, "p99": 307.265, "mean": 230.719266, "measured_calls_per_second": 4334.271763850012},
+    "feedback_arbitration": {"n": 5000, "unit": "us", "p50": 3.667, "p95": 3.807, "p99": 4.629, "mean": 3.7333228000000003, "measured_calls_per_second": 267857.898599071}
+  }
+}

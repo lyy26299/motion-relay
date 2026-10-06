@@ -1,0 +1,85 @@
+{
+  "schema_version": "coach.feedback_benchmark.v1",
+  "source_revision": "b67a03c204fbd121825983a021bf55a1dccdce6d",
+  "source_modules": {
+    "coach": {
+      "path": "coach/__init__.py",
+      "sha256": "8c44b259055a4769b19d19d43b46cce6ed93706ea1be8a68adfe08a6e41e7aef"
+    },
+    "coach.feedback_state": {
+      "path": "coach/feedback_state.py",
+      "sha256": "7e4df5e62f8ed5d71d345f719144f8dd1caeefde6f47241cb865707bdeb110b9"
+    },
+    "coach.memory": {
+      "path": "coach/memory/__init__.py",
+      "sha256": "9b7b9e145c659da7f7fee71805a0921d8479f8c88e6c7f9e4755583d82645954"
+    },
+    "coach.memory.consolidate": {
+      "path": "coach/memory/consolidate.py",
+      "sha256": "b649498ff7be8bf52453df364db829f90f6ecb1e16bc8af0062c990bd5347c93"
+    },
+    "coach.memory.feedback": {
+      "path": "coach/memory/feedback.py",
+      "sha256": "0f7aa1f350776b486a213471585679d53417f8d37359429bacd543e0a740902d"
+    },
+    "coach.memory.retrieval": {
+      "path": "coach/memory/retrieval.py",
+      "sha256": "39eefa28ba60feeadd77db34da00dc62ad050b2b6ba2f5a75dd926397b1f5721"
+    },
+    "coach.memory.store": {
+      "path": "coach/memory/store.py",
+      "sha256": "f92f91d59516ad72c20ac3fff357e6626bc92544af20f8e7ae435c9dc3c0e899"
+    },
+    "coach.qwen_contract": {
+      "path": "coach/qwen_contract.py",
+      "sha256": "d056f86869246092bd16e16770a330c8ef603bc8109f4f312353ee3108163bac"
+    }
+  },
+  "environment": {
+    "python": "3.13.15",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "sqlite": "3.45.1"
+  },
+  "method": "100 warmups + measured samples; nearest-rank percentiles; precreated receipts",
+  "invariant_observations_per_path": 1100,
+  "metrics": {
+    "legacy_three_observation_cycle": {
+      "n": 1000,
+      "unit": "us",
+      "p50": 115.388,
+      "p95": 143.991,
+      "p99": 168.919,
+      "mean": 120.208258,
+      "measured_calls_per_second": 8318.896027925137
+    },
+    "guarded_three_observation_cycle": {
+      "n": 1000,
+      "unit": "us",
+      "p50": 325.485,
+      "p95": 358.808,
+      "p99": 384.806,
+      "mean": 332.581949,
+      "measured_calls_per_second": 3006.7777370563185
+    },
+    "feedback_status_join": {
+      "n": 1000,
+      "unit": "us",
+      "p50": 0.321,
+      "p95": 0.351,
+      "p99": 0.38,
+      "mean": 0.32607800000000003,
+      "measured_calls_per_second": 3066750.9000913887
+    }
+  },
+  "invariants": {
+    "legacy_terminal_regressions_including_warmups": 1100,
+    "guarded_terminal_regressions_including_warmups": 0
+  },
+  "limitations": [
+    "legacy and guarded cycles have different correctness contracts, not a speedup contest",
+    "in-memory SQLite; no disk fsync, contention, executor scheduling or power-loss test",
+    "no camera, network, LLM, TTS, speaker, actual playback acknowledgment or user study",
+    "legacy low-level API intentionally unchanged; application must use the scoped recorder"
+  ]
+}
