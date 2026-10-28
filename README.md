@@ -71,3 +71,5 @@
 </details>
 
 测量批次：`basecase-20261026-140431-254346`，数据来自该批次 `benchmark.json`，汇总已按逐轮样本复核。测试对象为 [`research/agent-architecture-v2` 开发工作区](https://github.com/lyy26299/motion-relay/tree/research/agent-architecture-v2)，包含采集当时尚未提交的 tracing/benchmark 改动；本节记录该工作区的实测结果，不代表 `main` 的性能验收，也不代表多场景或真实硬件语音体验的评测。
+
+<!-- YOLO achievement test -->
